@@ -1,147 +1,150 @@
-# RepoAnalyzer
+# RepoAnalyzer v2 — Agentic
 
-AI-powered code repository analyzer that generates comprehensive PDF reports with architecture diagrams, flow diagrams, component analysis, and detailed code overviews — using your choice of LLM provider.
+An **agentic** AI-powered code repository analyzer. Unlike a traditional pipeline where code
+tells the LLM what to do step-by-step, here **the LLM agent drives the entire analysis** —
+deciding which files to read, what to search for, when to go deeper, and when it's done.
 
-## Features
+## What Makes It Agentic
 
-- 🔍 **Deep code analysis** — scans all code, config, and documentation files
-- 🤖 **Multi-LLM support** — Anthropic Claude, OpenAI GPT, AWS Bedrock (Claude, Llama, Mistral, Titan, Nova), Ollama (local), Google Gemini
-- 📊 **Visual diagrams** — auto-generated architecture, data flow, and component diagrams (Mermaid)
-- 📄 **Rich PDF output** — cover page, TOC, executive summary, tech stack, components, API endpoints, file-by-file breakdown, and improvement suggestions
-- ⚡ **Fast** — analyzes most repos in under 60 seconds
-- 🎯 **CLI-first** — simple command-line interface
+```
+v1 (pipeline):   scan → analyze_overview → analyze_components → analyze_files → build_pdf
+                 [fixed script, LLM called as dumb function at each step]
+
+v2 (agentic):    agent starts → agent DECIDES what to do → tools execute → agent reflects
+                 → agent DECIDES next action → ... → agent signals DONE → build_pdf
+                 [LLM is the decision-maker, not the code]
+```
+
+The agent has 9 tools it can call in any order:
+
+| Tool | What the agent uses it for |
+|------|---------------------------|
+| `get_file_stats` | Orient — understand repo scale and shape |
+| `list_directory` | Explore — browse directories selectively |
+| `read_file` | Deep read — understand specific files fully |
+| `read_multiple_files` | Batch read — compare related files |
+| `search_code` | Trace — find where patterns appear across files |
+| `analyze_imports` | Map — understand module dependency graph |
+| `record_finding` | Save — persist insights as it discovers them |
+| `generate_diagram` | Visualise — create Mermaid diagrams when ready |
+| `finish_analysis` | Done — signal completion with executive summary |
+
+The agent decides the order. It might read README first, then trace imports, search for
+auth patterns, read 3 files at once, record a security finding, then decide it needs to
+look at a config file it spotted — all before generating any diagram.
 
 ## Installation
 
 ```bash
 pip install -e .
 
-# For AWS Bedrock support:
+# AWS Bedrock support
 pip install -e ".[bedrock]"
 ```
 
 ## Usage
 
 ```bash
-# Basic usage with Anthropic Claude (default)
-repoanalyzer /path/to/your/repo
+# Anthropic Claude (default)
+export ANTHROPIC_API_KEY=sk-ant-...
+repoanalyzer /path/to/repo
 
-# Specify provider and model
-repoanalyzer /path/to/repo --provider anthropic --model claude-sonnet-4-20250514
+# OpenAI
+export OPENAI_API_KEY=sk-...
 repoanalyzer /path/to/repo --provider openai --model gpt-4o
-repoanalyzer /path/to/repo --provider bedrock --model anthropic.claude-3-5-sonnet-20241022-v2:0
+
+# AWS Bedrock — Claude
+export AWS_REGION=us-east-1
+repoanalyzer /path/to/repo --provider bedrock \
+  --model anthropic.claude-3-5-sonnet-20241022-v2:0
+
+# AWS Bedrock — Amazon Nova
+repoanalyzer /path/to/repo --provider bedrock --model amazon.nova-pro-v1:0
+
+# AWS Bedrock — Meta Llama
+repoanalyzer /path/to/repo --provider bedrock \
+  --model meta.llama3-1-70b-instruct-v1:0
+
+# AWS Bedrock — Mistral
+repoanalyzer /path/to/repo --provider bedrock \
+  --model mistral.mistral-large-2402-v1:0
+
+# Ollama (local, needs tool-use capable model)
+ollama pull llama3.2
 repoanalyzer /path/to/repo --provider ollama --model llama3.2
+
+# Google Gemini
+export GEMINI_API_KEY=...
 repoanalyzer /path/to/repo --provider gemini --model gemini-2.0-flash
 
-# Custom output path
-repoanalyzer /path/to/repo --output ./reports/myrepo.pdf
-
-# Exclude patterns
-repoanalyzer /path/to/repo --exclude "*.test.*" --exclude "migrations"
-
-# Limit scope
-repoanalyzer /path/to/repo --max-files 100 --max-file-size 50000
-
-# Verbose output
-repoanalyzer /path/to/repo --verbose
+# Custom output and limits
+repoanalyzer /path/to/repo --output ./reports/myrepo.pdf --max-iterations 30
 ```
-
-## Supported LLM Providers
-
-### Anthropic Claude
-```bash
-export ANTHROPIC_API_KEY=your_key
-repoanalyzer . --provider anthropic --model claude-sonnet-4-20250514
-```
-
-### OpenAI
-```bash
-export OPENAI_API_KEY=your_key
-repoanalyzer . --provider openai --model gpt-4o
-```
-
-### AWS Bedrock
-Supports: Claude, Llama, Mistral, Amazon Titan, Amazon Nova
-```bash
-export AWS_REGION=us-east-1
-export AWS_ACCESS_KEY_ID=your_key
-export AWS_SECRET_ACCESS_KEY=your_secret
-
-# Claude on Bedrock
-repoanalyzer . --provider bedrock --model anthropic.claude-3-5-sonnet-20241022-v2:0
-
-# Llama on Bedrock
-repoanalyzer . --provider bedrock --model meta.llama3-70b-instruct-v1:0
-
-# Mistral on Bedrock
-repoanalyzer . --provider bedrock --model mistral.mixtral-8x7b-instruct-v0:1
-
-# Amazon Nova
-repoanalyzer . --provider bedrock --model amazon.nova-pro-v1:0
-```
-
-Or use IAM roles / AWS profiles — boto3 uses standard AWS credential chain.
-
-### Ollama (Local)
-```bash
-ollama serve
-ollama pull llama3.2
-repoanalyzer . --provider ollama --model llama3.2
-```
-
-### Google Gemini
-```bash
-export GEMINI_API_KEY=your_key
-repoanalyzer . --provider gemini --model gemini-2.0-flash
-```
-
-## PDF Report Structure
-
-1. **Cover Page** — repo name, purpose, stats (files, lines, languages)
-2. **Table of Contents**
-3. **Executive Summary** — purpose, design patterns, testing, deployment
-4. **Technology Stack** — tech badges, dependency list, language breakdown
-5. **Architecture Overview** — style, data flow, database models
-6. **System Architecture Diagram** — auto-generated Mermaid diagram
-7. **Data Flow Diagram** — sequence diagram of main flows
-8. **Component Diagram** — module dependency graph
-9. **Key Components** — description, responsibilities, dependencies per component
-10. **API Endpoints** — table of all detected endpoints
-11. **Code Quality & Security** — quality observations, security notes
-12. **File-by-File Analysis** — purpose, classes, functions, complexity for each file
-13. **Improvement Recommendations** — actionable suggestions
-14. **Repository File Tree** — full directory structure
 
 ## Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `repo_path` | (required) | Path to the repository |
+| `repo_path` | required | Path to the repository |
 | `--provider` | `anthropic` | LLM provider |
 | `--model` | provider default | Model name/ID |
 | `--output` | `<repo>-report.pdf` | Output PDF path |
-| `--exclude` | none | Glob patterns to exclude (repeatable) |
-| `--max-files` | 200 | Max files to analyze |
-| `--max-file-size` | 100000 | Skip files larger than N bytes |
+| `--max-iterations` | `40` | Max agent loop steps |
+| `--exclude` | none | Glob patterns to exclude |
+| `--max-files` | `200` | File scan limit |
+| `--max-file-size` | `100000` | Per-file size limit (bytes) |
 | `--ollama-url` | `http://localhost:11434` | Ollama server URL |
-| `--verbose` | false | Detailed progress output |
+| `--verbose` | false | Detailed step output |
 
-## Requirements
+## PDF Report Sections
 
-- Python 3.9+
-- `reportlab` (PDF generation)
-- `boto3` (optional, for AWS Bedrock)
-- Network access to mermaid.ink for diagram rendering (falls back gracefully)
+1. Cover page — repo name, purpose, key stats
+2. Table of Contents
+3. Executive Summary — architecture style, design patterns, deployment
+4. Technology Stack — tech badges, dependency list, language breakdown table
+5. Architecture Overview — data flow steps, database models
+6. System Architecture Diagram — auto-generated by the agent
+7. Data Flow Diagram — sequence diagram the agent constructed
+8. Component Diagram — module dependency graph
+9. Key Components — each with description, responsibilities, and linked files
+10. API Endpoints — table of detected routes
+11. Code Quality & Security — the agent's quality and security observations
+12. File-by-File Analysis — per-file detail from agent's reading
+13. Improvement Recommendations — the agent's concrete suggestions
+14. Repository File Tree — full directory listing
+15. Appendix: Agentic Analysis Trace — step count, tool calls, tokens, elapsed time
 
 ## Architecture
 
 ```
-repoanalyzer/
-├── __main__.py      # CLI entry point & argument parsing
-├── providers.py     # LLM provider abstraction (Anthropic, OpenAI, Bedrock, Ollama, Gemini)
-├── scanner.py       # Repository file walker & content collector
-├── analyzer.py      # LLM-powered analysis pipeline
-├── diagrams.py      # Mermaid → PNG conversion
-├── pdf_generator.py # ReportLab PDF builder
-└── pipeline.py      # Orchestration
+repoanalyzer_v2/
+├── __main__.py    CLI entry point
+├── providers.py   LLM backends with tool-use support
+│                  (Anthropic, OpenAI, Bedrock, Ollama, Gemini)
+├── tools.py       Tool definitions + ToolExecutor
+│                  (9 tools the agent can call)
+├── agent.py       The agentic loop — LLM drives the conversation
+├── scanner.py     Lightweight repo walker (for PDF stats)
+├── results.py     Compiles raw agent findings → AnalysisResult
+├── diagrams.py    Mermaid → PNG via mermaid.ink
+├── pdf_generator.py  ReportLab PDF builder (15 sections)
+└── pipeline.py    Orchestration: provider → loop → compile → PDF
 ```
+
+## Bedrock Models with Tool Use
+
+The Bedrock provider uses the **Converse API** which supports tool use
+across multiple model families:
+
+| Model ID | Family | Notes |
+|----------|--------|-------|
+| `anthropic.claude-3-5-sonnet-20241022-v2:0` | Claude | Best quality |
+| `anthropic.claude-3-haiku-20240307-v1:0` | Claude | Fast & cheap |
+| `amazon.nova-pro-v1:0` | Nova | Amazon flagship |
+| `amazon.nova-lite-v1:0` | Nova | Fast |
+| `meta.llama3-1-70b-instruct-v1:0` | Llama | Open source |
+| `meta.llama3-1-8b-instruct-v1:0` | Llama | Smallest |
+| `mistral.mistral-large-2402-v1:0` | Mistral | Strong reasoning |
+
+AWS credentials are picked up via the standard boto3 chain:
+environment variables, `~/.aws/credentials`, or IAM roles.
