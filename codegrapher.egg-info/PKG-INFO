@@ -1,3 +1,21 @@
+Metadata-Version: 2.1
+Name: codegrapher
+Version: 1.0.0
+Summary: Agentic repository analyzer — LangGraph ReAct loop, graphify AST/graph extraction, offline Mermaid diagrams, multi-LLM support, PDF report.
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Topic :: Software Development :: Libraries
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Provides-Extra: bedrock
+Provides-Extra: gemini
+Provides-Extra: all
+
 # CodeGrapher
 
 Agentic repository analyzer that generates a comprehensive PDF report with architecture diagrams, data flow, component analysis, and code insights.
