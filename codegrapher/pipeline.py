@@ -5,9 +5,10 @@ Wires together:
   1.  LLM provider creation   (codegrapher.agent.providers)
   2.  LangGraph agentic loop  (codegrapher.agent.graph)
        └─ tools call into     (codegrapher.core.*) for graph work
-  3.  Mermaid diagrams        (codegrapher.output.mermaid_converter)
-       └─ rendered via        (codegrapher.output.diagrams)  — offline-capable
+  3.  JSON document builder   (codegrapher.agent.json_agent)
+       └─ converts tool outputs → structured analysis JSON
   4.  PDF report              (codegrapher.output.pdf_generator)
+       └─ renders JSON → PDF  (no Mermaid, no diagram rendering)
 """
 from __future__ import annotations
 
@@ -57,7 +58,7 @@ def run_pipeline(args: Namespace) -> None:
         state_accumulator, final_state = run_agent(
             llm=llm,
             repo_root=args.repo_path,
-            max_iterations=getattr(args, "max_iterations", 35),
+            max_iterations=getattr(args, "max_iterations", 50),
             verbose=True,
         )
     except Exception as e:
@@ -67,28 +68,39 @@ def run_pipeline(args: Namespace) -> None:
             traceback.print_exc()
         sys.exit(1)
 
-    findings = state_accumulator.get("findings", [])
-    diagrams_raw = state_accumulator.get("diagrams", [])
+    findings = state_accumulator.get("finish_data", {})
     iteration = final_state.get("iteration", 0)
 
     print(f"\n   ✅ Agent completed:")
     print(f"      Steps        : {iteration}")
-    print(f"      Findings     : {len(findings)}")
     print(f"      God nodes    : {len(state_accumulator.get('god_nodes', []))}")
     print(f"      Communities  : {len(state_accumulator.get('communities', {}))}")
 
     if not state_accumulator.get("finished"):
         print("      ⚠️  finish_analysis not called — report may be partial")
 
-    # ── 3. Generate diagrams from real graph data ─────────────────────────────
-    print("\n📊 Generating diagrams from graph data...")
+    # ── 3. Build structured JSON document from tool outputs ───────────────────
+    print("\n📋 Building structured analysis JSON...")
     try:
-        from codegrapher.output.mermaid_converter import generate_all_diagrams
-        diagrams = generate_all_diagrams(state_accumulator)
-        state_accumulator["diagrams"] = diagrams
-        print(f"   Diagrams     : {[d['diagram_type'] for d in diagrams]}")
+        from codegrapher.agent.json_agent import build_analysis_json, build_analysis_json_string
+        analysis_doc = build_analysis_json(
+            state_accumulator=state_accumulator,
+            repo_name=args.repo_path.resolve().name,
+            provider_name=pname,
+            total_files=total_files,
+            total_lines=0,
+            agent_steps=iteration,
+            elapsed_seconds=elapsed,
+            directory_tree=tree,
+        )
+        # Optionally persist JSON alongside the PDF for debugging / downstream use
+        json_path = args.output.with_suffix(".json")
+        json_path.write_text(build_analysis_json_string(analysis_doc), encoding="utf-8")
+        print(f"   JSON saved   : {json_path}")
+        state_accumulator["analysis_doc"] = analysis_doc
     except Exception as e:
-        print(f"   ⚠️  Diagram generation failed: {e} — continuing without diagrams")
+        print(f"   ⚠️  JSON build failed: {e} — PDF will use raw state_accumulator")
+        analysis_doc = None
 
     # ── 4. Collect stats ──────────────────────────────────────────────────────
     scan = state_accumulator.get("scan_result", {})
@@ -102,19 +114,23 @@ def run_pipeline(args: Namespace) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        from codegrapher.output.pdf_generator import generate_pdf
-        generate_pdf(
-            output_path=output_path,
-            repo_name=args.repo_path.resolve().name,
-            provider_name=pname,
-            state_accumulator=state_accumulator,
-            directory_tree=tree,
-            total_files=total_files,
-            total_lines=0,
-            agent_steps=iteration,
-            agent_tool_calls=iteration,
-            elapsed_seconds=elapsed,
-        )
+        from codegrapher.output.pdf_generator import generate_pdf_from_json, generate_pdf
+        if analysis_doc is not None:
+            generate_pdf_from_json(output_path=output_path, doc=analysis_doc)
+        else:
+            # Fallback: use legacy shim (builds JSON internally)
+            generate_pdf(
+                output_path=output_path,
+                repo_name=args.repo_path.resolve().name,
+                provider_name=pname,
+                state_accumulator=state_accumulator,
+                directory_tree=tree,
+                total_files=total_files,
+                total_lines=0,
+                agent_steps=iteration,
+                agent_tool_calls=iteration,
+                elapsed_seconds=elapsed,
+            )
     except Exception as e:
         print(f"error generating PDF: {e}", file=sys.stderr)
         if getattr(args, "verbose", False):

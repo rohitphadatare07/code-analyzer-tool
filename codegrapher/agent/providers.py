@@ -36,32 +36,18 @@ BEDROCK_MODELS = {
 
 
 def _bedrock_llm(model_id: str, region: str) -> BaseChatModel:
-    """Return a LangChain chat model for an AWS Bedrock model with retry config."""
+    """Return a LangChain chat model for an AWS Bedrock model."""
     try:
         from langchain_aws import ChatBedrock
-        import boto3
-        from botocore.config import Config
     except ImportError:
         raise ImportError(
             "langchain-aws and boto3 are required for Bedrock.\n"
             "Install: pip install langchain-aws boto3"
         )
 
-    # Adaptive retry: boto3 adjusts timing based on throttling rate.
-    # max_attempts=8 handles brief throttling before app-level retry kicks in.
-    boto_config = Config(
-        retries={"mode": "adaptive", "max_attempts": 8},
-        read_timeout=120,
-        connect_timeout=10,
-    )
-    client = boto3.Session(region_name=region).client(
-        "bedrock-runtime", config=boto_config
-    )
-
     return ChatBedrock(
         model_id=model_id,
         region_name=region,
-        client=client,
         model_kwargs={"temperature": 0},
     )
 
