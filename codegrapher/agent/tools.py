@@ -373,27 +373,24 @@ def make_tools(
             return f"ERROR: {e}"
 
     # ── Exploration tool 5: read_file ─────────────────────────────────────────
-    @tool
+    _read_file_desc = (
+        f"Read a file from the repository. Budget: {file_budget} calls total.\n\n"
+        "SPEND THIS BUDGET ON:\n"
+        "  - God nodes listed by analyze_graph (highest architectural value)\n"
+        "  - Files in surprising cross-community connections\n"
+        "  - Entry points (index.js, main.py, boot.js, app.ts, manage.py)\n"
+        "  - Files that failed a specific assessment check\n\n"
+        "DO NOT read files randomly. Every call must be motivated by a\n"
+        "specific finding from the pipeline tools.\n\n"
+        "AFTER READING: call record_finding immediately with what you learned.\n"
+        "Do not read multiple files before recording — record as you go.\n\n"
+        "Args:\n"
+        "    path:      Relative path from repo root\n"
+        "    max_lines: Lines to read (default 200, max 400)"
+    )
+
+    @tool(description=_read_file_desc)
     def read_file(path: str, max_lines: int = 200) -> str:
-        f"""
-        Read a file from the repository. Budget: {file_budget} calls total.
-
-        SPEND THIS BUDGET ON:
-          - God nodes listed by analyze_graph (highest architectural value)
-          - Files in surprising cross-community connections
-          - Entry points (index.js, main.py, boot.js, app.ts, manage.py)
-          - Files that failed a specific assessment check
-
-        DO NOT read files randomly. Every call must be motivated by a
-        specific finding from the pipeline tools.
-
-        AFTER READING: call record_finding immediately with what you learned.
-        Do not read multiple files before recording — record as you go.
-
-        Args:
-            path:      Relative path from repo root
-            max_lines: Lines to read (default 200, max 400)
-        """
         # Budget enforcement
         if counts.get("read_file", 0) >= file_budget:
             return _budget_exhausted("read_file", file_budget)
@@ -429,31 +426,29 @@ def make_tools(
         )
 
     # ── Exploration tool 6: search_code ───────────────────────────────────────
-    @tool
+    _search_code_desc = (
+        f"Search for a pattern across source files. Budget: {search_budget} calls total.\n\n"
+        "HIGH-VALUE searches (spend budget on these):\n"
+        "  - All API routes: 'app\\.get|router\\.post|@GetMapping'\n"
+        "  - DB model definitions: 'class.*Model|Schema\\('\n"
+        "  - Config/env usage: 'process\\.env|os\\.environ'\n"
+        "  - Verify a specific coupling: 'require.*knex|import.*db'\n\n"
+        "LOW-VALUE searches (do NOT waste budget on these):\n"
+        '  - Things scan_repository already told you (file counts, languages)\n'
+        "  - The same concept twice with different patterns\n"
+        '  - General exploration ("security", "test", "cache")\n\n'
+        "Args:\n"
+        "    pattern:     Regex or plain text\n"
+        "    file_glob:   Limit to matching files (e.g. '*.ts', '*.py')\n"
+        "    max_results: Max matches (default 15)"
+    )
+
+    @tool(description=_search_code_desc)
     def search_code(
         pattern:     str,
         file_glob:   str = "*",
         max_results: int = 15,
     ) -> str:
-        f"""
-        Search for a pattern across source files. Budget: {search_budget} calls total.
-
-        HIGH-VALUE searches (spend budget on these):
-          - All API routes: 'app\\.get|router\\.post|@GetMapping'
-          - DB model definitions: 'class.*Model|Schema\\('
-          - Config/env usage: 'process\\.env|os\\.environ'
-          - Verify a specific coupling: 'require.*knex|import.*db'
-
-        LOW-VALUE searches (do NOT waste budget on these):
-          - Things scan_repository already told you (file counts, languages)
-          - The same concept twice with different patterns
-          - General exploration ("security", "test", "cache")
-
-        Args:
-            pattern:     Regex or plain text
-            file_glob:   Limit to matching files (e.g. '*.ts', '*.py')
-            max_results: Max matches (default 15)
-        """
         if counts.get("search_code", 0) >= search_budget:
             return _budget_exhausted("search_code", search_budget)
 
@@ -499,7 +494,24 @@ def make_tools(
         return result + f"\n\n[search_code: {remaining}/{search_budget} calls remaining]"
 
     # ── Exploration tool 7: record_finding ────────────────────────────────────
-    @tool
+    _record_finding_desc = (
+        f"Record a finding. Budget: {finding_budget} calls total.\n\n"
+        "QUALITY REQUIREMENT — every finding needs all four elements:\n"
+        "  WHAT:        What exactly did you find? Name the actual file/component.\n"
+        "  WHY:         Why does this matter architecturally?\n"
+        "  CONSEQUENCE: What breaks or cannot scale if unaddressed?\n"
+        "  HOW:         Specific fix — name the exact AWS service or pattern.\n\n"
+        "Findings with fewer than 3 sentences are REJECTED.\n"
+        "Record IMMEDIATELY after each read_file or search_code result.\n\n"
+        "category: architecture | component | data_flow | api_endpoint |\n"
+        "          security | tech_stack | design_pattern | code_quality |\n"
+        "          improvement | entry_point | dependency | database_model |\n"
+        "          testing | deployment | file_detail |\n"
+        "          architecture_gap | cloud_readiness | modernization_target |\n"
+        "          security_risk"
+    )
+
+    @tool(description=_record_finding_desc)
     def record_finding(
         category:   str,
         title:      str,
@@ -507,25 +519,6 @@ def make_tools(
         files:      Optional[list] = None,
         confidence: str = "high",
     ) -> str:
-        f"""
-        Record a finding. Budget: {finding_budget} calls total.
-
-        QUALITY REQUIREMENT — every finding needs all four elements:
-          WHAT:        What exactly did you find? Name the actual file/component.
-          WHY:         Why does this matter architecturally?
-          CONSEQUENCE: What breaks or cannot scale if unaddressed?
-          HOW:         Specific fix — name the exact AWS service or pattern.
-
-        Findings with fewer than 3 sentences are REJECTED.
-        Record IMMEDIATELY after each read_file or search_code result.
-
-        category: architecture | component | data_flow | api_endpoint |
-                  security | tech_stack | design_pattern | code_quality |
-                  improvement | entry_point | dependency | database_model |
-                  testing | deployment | file_detail |
-                  architecture_gap | cloud_readiness | modernization_target |
-                  security_risk
-        """
         # Budget enforcement
         if counts.get("record_finding", 0) >= finding_budget:
             return _budget_exhausted("record_finding", finding_budget)
