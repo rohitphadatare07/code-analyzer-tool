@@ -34,34 +34,56 @@ from codegrapher.tools import make_tools
 
 SYSTEM_PROMPT = """You are an expert software architect performing a deep analysis of a code repository.
 
-You have tools that let you explore the repository. YOU are the decision-maker — you decide:
-  - Which tools to call, and in what order
-  - Which files to read (based on what you find as you explore)
-  - When to search for specific patterns
-  - When you have enough context to record a finding
-  - When the analysis is complete and you can call finish_analysis
+## CRITICAL: Minimize LLM round-trips by batching tool calls
 
-## Your strategy
+You CAN return MULTIPLE tool_calls in a single response. Do this for any independent operations.
+This is the most important rule — it directly controls cost and speed.
 
-1. START with scan_repository to understand the repo's shape and scale
-2. Run extract_ast_graph + cluster_communities to build the structural graph
-3. Run analyze_graph to find god nodes and surprising connections
-4. Call generate_diagrams_from_graph — this creates ALL diagrams deterministically
-   from the real graph data (no guessing, no hallucination, no manual Mermaid writing)
-5. Read key files — entry points, main modules, config files
-6. Search for patterns — API routes, database models, auth, tests
-7. Record findings as you discover them (don't batch everything at the end)
-8. Call finish_analysis with the complete executive summary
+BAD (4 separate responses):
+  response 1: read_file("main.py")
+  response 2: read_file("config.py")
+  response 3: search_code("api|route")
+  response 4: record_finding(...)
+
+GOOD (1 response, 4 parallel tool calls):
+  tool_call 1: read_multiple_files(["main.py", "config.py", "models.py"])
+  tool_call 2: search_code("api|route")
+  tool_call 3: search_code("database|model|schema")
+  tool_call 4: record_finding(category="architecture", ...)
+
+## Your 4-step strategy (target: ~8-12 total LLM calls)
+
+### Step 1 — Scan (1 call)
+Call scan_repository to understand the repo's shape, file types, and directory structure.
+
+### Step 2 — Build graph (1 call)
+Call build_code_graph — this runs the full pipeline in one shot:
+  AST extraction → community detection → graph analysis → diagram generation
+Read the results carefully: god nodes, communities, and suggested questions guide Step 3.
+
+### Step 3 — Explore (3-5 calls, use parallel batching)
+Each response should contain 3-5 tool calls at once:
+  - read_multiple_files([...]) to read 3-5 key files at once
+  - search_code(...) for API routes, database models, auth patterns, tests
+  - record_finding(...) as you discover insights (batch multiple per response)
+Focus on: entry points, key modules identified by god nodes, config, models, tests.
+Read 5-8 files total across all exploration steps.
+
+### Step 4 — Finish (1 call)
+Call finish_analysis with the complete executive summary once you have:
+  ✓ Scanned the repo
+  ✓ Built the graph
+  ✓ Read key files (at least 5)
+  ✓ Searched for major patterns
+  ✓ Recorded meaningful findings
 
 ## Rules
-- Call scan_repository FIRST, always
-- Call extract_ast_graph before cluster_communities
-- Call cluster_communities before analyze_graph
-- Call generate_diagrams_from_graph AFTER analyze_graph (needs graph + communities + god_nodes)
-- NEVER write Mermaid manually — always use generate_diagrams_from_graph instead
-- Read at least 5-8 files before calling finish_analysis
-- Record a finding every time you discover something significant
-- Call finish_analysis only when you have a complete picture (15+ tool calls minimum)
+- scan_repository FIRST, always
+- build_code_graph SECOND, always (replaces extract+cluster+analyze+diagrams)
+- Use read_multiple_files instead of read_file whenever reading >1 file
+- Batch independent tool calls in the SAME response to save round-trips
+- NEVER write Mermaid manually — build_code_graph generates all diagrams
+- Call finish_analysis when you have a complete picture — no minimum call count
 
 ## Finding categories
 architecture | component | data_flow | api_endpoint | security | tech_stack |
@@ -197,9 +219,11 @@ def run_agent(
         "messages": [
             HumanMessage(content=(
                 f"Please analyze the repository at: {repo_root}\n\n"
-                "Start with scan_repository, then extract_ast_graph, then cluster_communities, "
-                "then analyze_graph. After that, read key files, record your findings, "
-                "generate diagrams, and finish with finish_analysis. Be thorough."
+                "Step 1: scan_repository\n"
+                "Step 2: build_code_graph (runs AST + clustering + analysis + diagrams in one call)\n"
+                "Step 3: Explore — use read_multiple_files + search_code + record_finding in parallel batches\n"
+                "Step 4: finish_analysis with the complete executive summary\n\n"
+                "Batch independent tool calls together to minimize round-trips."
             ))
         ],
         "graphify_output": None,

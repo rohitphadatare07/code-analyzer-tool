@@ -7,14 +7,17 @@ it is not hard-coded to call them in order.
 
 Tools available to the agent:
   1. scan_repository        - detect files + build dir tree
-  2. extract_ast_graph      - run graphify AST extraction (tree-sitter)
-  3. cluster_communities    - run Leiden/Louvain community detection
-  4. analyze_graph          - find god nodes, surprising connections
-  5. read_file              - read a specific file (agent decides which)
-  6. search_code            - grep across the repo
-  7. record_finding         - save an insight
-  8. record_diagram         - save a Mermaid diagram
-  9. finish_analysis        - signal completion with executive summary
+  2. build_code_graph       - AST extraction + clustering + analysis + diagrams (all-in-one)
+  3. read_file              - read a specific file (agent decides which)
+  4. read_multiple_files    - read up to 5 files in a single call (use instead of looping read_file)
+  5. search_code            - grep across the repo
+  6. record_finding         - save an insight
+  7. finish_analysis        - signal completion with executive summary
+
+Design principle: minimize LLM round-trips by batching sequential/parallel work.
+  - build_code_graph replaces 4 sequential single-step tools (saves ~3 LLM calls)
+  - read_multiple_files replaces N individual read_file calls (saves N-1 LLM calls)
+  - The agent should return multiple tool_calls per response when operations are independent
 """
 from __future__ import annotations
 
@@ -140,24 +143,35 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
         state_accumulator["scan_result"] = result
         return json.dumps(result, indent=2)
 
-    # ── 2. extract_ast_graph ──────────────────────────────────────────────────
+    # ── 2. build_code_graph ───────────────────────────────────────────────────
     @tool
-    def extract_ast_graph() -> str:
+    def build_code_graph() -> str:
         """
-        Run graphify's AST extraction using tree-sitter on all code files.
-        Extracts classes, functions, imports, and call relationships.
-        Returns a summary of extracted nodes and edges.
-        Call this after scan_repository to build the structural graph.
+        Run the full graphify pipeline in one shot:
+          1. AST extraction (tree-sitter) — extracts classes, functions, imports, calls
+          2. Community detection (Leiden/Louvain) — groups related code into clusters
+          3. Graph analysis — finds god nodes and surprising cross-community connections
+          4. Diagram generation — produces architecture/flow/component Mermaid diagrams
+
+        Call this ONCE after scan_repository. It replaces the four separate steps
+        (extract_ast_graph, cluster_communities, analyze_graph, generate_diagrams_from_graph)
+        with a single LLM round-trip.
+
+        Returns a combined summary: nodes, edges, communities, god nodes, and diagram status.
         """
+        # ── Step 1: AST extraction ────────────────────────────────────────────
         try:
             from codegrapher.core.detect import detect
             from codegrapher.core.extract import collect_files, extract as gf_extract
             from codegrapher.core.build import build_from_json
+            from codegrapher.core.cluster import cluster, score_all
+            from codegrapher.core.analyze import (
+                god_nodes as gf_god_nodes,
+                surprising_connections,
+                suggest_questions,
+            )
         except ImportError:
-            return json.dumps({
-                "error": "graphify not installed. Run: pip install graphifyy",
-                "nodes": 0, "edges": 0,
-            })
+            return json.dumps({"error": "graphify not installed. Run: pip install graphifyy"})
 
         try:
             detection = detect(root)
@@ -174,57 +188,26 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
                 state_accumulator["graphify_ast"] = {"nodes": [], "edges": []}
                 return json.dumps({"message": "No code files found", "nodes": 0, "edges": 0})
 
-            result = gf_extract(code_files)
-            state_accumulator["graphify_ast"] = result
+            ast_result = gf_extract(code_files)
+            state_accumulator["graphify_ast"] = ast_result
             state_accumulator["detection"] = detection
 
-            # Quick summary for the agent
-            return json.dumps({
-                "nodes_extracted": len(result.get("nodes", [])),
-                "edges_extracted": len(result.get("edges", [])),
-                "files_processed": len(code_files),
-                "sample_nodes": [
-                    {"id": n["id"], "label": n.get("label", ""), "file": n.get("source_file", "")}
-                    for n in result.get("nodes", [])[:8]
-                ],
-            }, indent=2)
-
         except Exception as e:
-            return json.dumps({"error": str(e), "nodes": 0, "edges": 0})
+            return json.dumps({"error": f"AST extraction failed: {e}"})
 
-    # ── 3. cluster_communities ────────────────────────────────────────────────
-    @tool
-    def cluster_communities() -> str:
-        """
-        Run Leiden/Louvain community detection on the extracted graph.
-        Groups related code entities into semantic clusters.
-        Call this AFTER extract_ast_graph. Returns community labels and sizes.
-        """
+        # ── Step 2: Community detection ───────────────────────────────────────
         try:
-            from codegrapher.core.cluster import cluster, score_all, build_graph
-            from codegrapher.core.build import build_from_json
-        except ImportError:
-            return json.dumps({"error": "graphify not installed"})
-
-        ast_data = state_accumulator.get("graphify_ast")
-        if not ast_data:
-            return json.dumps({"error": "No AST data — call extract_ast_graph first"})
-
-        try:
-            G = build_from_json(ast_data)
+            G = build_from_json(ast_result)
             communities = cluster(G)
             cohesion = score_all(G, communities)
 
-            # Label each community by most common file/module prefix
             labels: dict[int, str] = {}
             for cid, node_ids in communities.items():
                 sources = [
-                    G.nodes[n].get("source_file", "") for n in node_ids
-                    if n in G.nodes
+                    G.nodes[n].get("source_file", "") for n in node_ids if n in G.nodes
                 ]
                 sources = [s for s in sources if s]
                 if sources:
-                    # Pick most common top-level path component
                     tops = [Path(s).parts[0] if Path(s).parts else s for s in sources]
                     labels[cid] = max(set(tops), key=tops.count)
                 else:
@@ -235,48 +218,10 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
             state_accumulator["cohesion"] = cohesion
             state_accumulator["community_labels"] = labels
 
-            return json.dumps({
-                "total_nodes": G.number_of_nodes(),
-                "total_edges": G.number_of_edges(),
-                "communities_detected": len(communities),
-                "communities": [
-                    {
-                        "id": cid,
-                        "label": labels.get(cid, f"Community {cid}"),
-                        "size": len(node_ids),
-                        "cohesion": cohesion.get(cid, 0.0),
-                    }
-                    for cid, node_ids in sorted(communities.items(), key=lambda x: len(x[1]), reverse=True)[:10]
-                ],
-            }, indent=2)
-
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            return json.dumps({"error": f"Community detection failed: {e}"})
 
-    # ── 4. analyze_graph ─────────────────────────────────────────────────────
-    @tool
-    def analyze_graph() -> str:
-        """
-        Run graphify's deep analysis: find god nodes (most-connected core abstractions),
-        surprising cross-community connections, and suggested investigation questions.
-        Call this AFTER cluster_communities.
-        """
-        try:
-            from codegrapher.core.analyze import (
-                god_nodes as gf_god_nodes,
-                surprising_connections,
-                suggest_questions,
-            )
-        except ImportError:
-            return json.dumps({"error": "graphify not installed"})
-
-        G = state_accumulator.get("graph")
-        communities = state_accumulator.get("communities")
-        labels = state_accumulator.get("community_labels", {})
-
-        if G is None or communities is None:
-            return json.dumps({"error": "Call cluster_communities first"})
-
+        # ── Step 3: Graph analysis ────────────────────────────────────────────
         try:
             god = gf_god_nodes(G, top_n=10)
             surprises = surprising_connections(G, communities, top_n=5)
@@ -286,16 +231,59 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
             state_accumulator["surprising_connections"] = surprises
             state_accumulator["suggested_questions"] = questions
 
-            return json.dumps({
-                "god_nodes": god,
-                "surprising_connections": surprises,
-                "suggested_questions": questions,
-            }, indent=2)
-
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            god, surprises, questions = [], [], []
+            state_accumulator["god_nodes"] = []
+            state_accumulator["surprising_connections"] = []
+            state_accumulator["suggested_questions"] = []
 
-    # ── 5. read_file ──────────────────────────────────────────────────────────
+        # ── Step 4: Diagram generation ────────────────────────────────────────
+        diagrams_summary = []
+        try:
+            from codegrapher.output.mermaid_converter import generate_all_diagrams
+            diagrams = generate_all_diagrams(state_accumulator)
+            state_accumulator["diagrams"] = diagrams
+            diagrams_summary = [
+                {"type": d["diagram_type"], "lines": d["mermaid_code"].count("\n") + 1}
+                for d in diagrams
+            ]
+        except Exception as e:
+            diagrams_summary = [{"error": str(e)}]
+
+        # ── Combined result ───────────────────────────────────────────────────
+        top_communities = [
+            {
+                "id": cid,
+                "label": labels.get(cid, f"Community {cid}"),
+                "size": len(node_ids),
+                "cohesion": cohesion.get(cid, 0.0),
+            }
+            for cid, node_ids in sorted(communities.items(), key=lambda x: len(x[1]), reverse=True)[:8]
+        ]
+
+        return json.dumps({
+            "ast": {
+                "nodes": len(ast_result.get("nodes", [])),
+                "edges": len(ast_result.get("edges", [])),
+                "files_processed": len(code_files),
+                "sample_nodes": [
+                    {"id": n["id"], "label": n.get("label", ""), "file": n.get("source_file", "")}
+                    for n in ast_result.get("nodes", [])[:6]
+                ],
+            },
+            "communities": {
+                "total_nodes": G.number_of_nodes(),
+                "total_edges": G.number_of_edges(),
+                "count": len(communities),
+                "top": top_communities,
+            },
+            "god_nodes": god[:5],
+            "surprising_connections": surprises[:3],
+            "suggested_questions": questions[:3],
+            "diagrams_generated": diagrams_summary,
+        }, indent=2)
+
+    # ── 3. read_file ──────────────────────────────────────────────────────────
     @tool
     def read_file(path: str, max_lines: int = 300) -> str:
         """
@@ -331,7 +319,51 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
 
         return f"=== {path} ({total} lines total) ===\n{content}"
 
-    # ── 6. search_code ────────────────────────────────────────────────────────
+    # ── 4b. read_multiple_files ───────────────────────────────────────────────
+    @tool
+    def read_multiple_files(paths: list, max_lines_each: int = 200) -> str:
+        """
+        Read up to 5 files in a single tool call.
+        Use this instead of calling read_file repeatedly — it saves LLM round-trips.
+
+        Args:
+            paths: List of relative file paths (max 5). e.g. ["main.py", "config.py", "models.py"]
+            max_lines_each: Max lines per file (default 200, max 300).
+        """
+        if not paths:
+            return "ERROR: No paths provided."
+        paths = paths[:5]  # hard cap
+        max_lines_each = min(max_lines_each, 300)
+
+        parts = []
+        for path in paths:
+            try:
+                resolved = _safe_resolve(root, path)
+            except ValueError as e:
+                parts.append(f"=== {path} ===\nERROR: {e}\n")
+                continue
+
+            if not resolved.exists():
+                parts.append(f"=== {path} ===\nERROR: File not found\n")
+                continue
+            if not resolved.is_file():
+                parts.append(f"=== {path} ===\nERROR: Not a file\n")
+                continue
+
+            try:
+                content = resolved.read_text(encoding="utf-8", errors="replace")
+                lines = content.split("\n")
+                total = len(lines)
+                if total > max_lines_each:
+                    content = "\n".join(lines[:max_lines_each])
+                    content += f"\n\n... [{total - max_lines_each} more lines]"
+                parts.append(f"=== {path} ({total} lines) ===\n{content}\n")
+            except Exception as e:
+                parts.append(f"=== {path} ===\nERROR: Cannot read: {e}\n")
+
+        return "\n".join(parts)
+
+    # ── 5. search_code ────────────────────────────────────────────────────────
     @tool
     def search_code(
         pattern: str,
@@ -414,45 +446,7 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
         state_accumulator["findings"].append(finding)
         return f"✓ Finding recorded [{category}]: {title}"
 
-    # ── 8. generate_diagrams_from_graph ───────────────────────────────────────
-    @tool
-    def generate_diagrams_from_graph() -> str:
-        """
-        Generate all three Mermaid diagrams DETERMINISTICALLY from the real
-        graphify graph data — no LLM guessing, no hallucination.
-
-        Produces:
-          - architecture : top-down module dependency graph (god nodes highlighted)
-          - flow         : sequence diagram from actual call/import edges
-          - components   : community-grouped LR diagram with cohesion scores
-
-        IMPORTANT: Call this AFTER cluster_communities and analyze_graph,
-        since it reads the NetworkX graph, communities, and god_nodes that
-        those tools computed and stored. Do NOT call record_diagram manually —
-        this tool replaces it with accurate, data-driven diagrams.
-        """
-        G = state_accumulator.get("graph")
-        if G is None:
-            return "ERROR: No graph found. Call extract_ast_graph and cluster_communities first."
-
-        try:
-            from codegrapher.output.mermaid_converter import generate_all_diagrams
-            diagrams = generate_all_diagrams(state_accumulator)
-            state_accumulator["diagrams"] = diagrams
-
-            summary = []
-            for d in diagrams:
-                lines = d["mermaid_code"].count("\n") + 1
-                summary.append(f"  [{d['diagram_type']}] {lines} lines — {d['description'][:80]}")
-
-            return (
-                f"✓ Generated {len(diagrams)} deterministic diagrams from graph data:\n"
-                + "\n".join(summary)
-            )
-        except Exception as e:
-            return f"ERROR generating diagrams: {e}"
-
-    # ── 9. finish_analysis ────────────────────────────────────────────────────
+    # ── 7. finish_analysis ────────────────────────────────────────────────────
     @tool
     def finish_analysis(
         summary: str,
@@ -510,12 +504,10 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
 
     return [
         scan_repository,
-        extract_ast_graph,
-        cluster_communities,
-        analyze_graph,
+        build_code_graph,
         read_file,
+        read_multiple_files,
         search_code,
         record_finding,
-        generate_diagrams_from_graph,
         finish_analysis,
     ]
