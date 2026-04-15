@@ -139,6 +139,66 @@ When a file you read imports something unexpected:
 """
 
 
+# ── Safe context trimming ──────────────────────────────────────────────────────
+
+def _trim_messages_safe(messages: list, target: int) -> list:
+    """
+    Trim conversation history to at most `target` messages while preserving
+    all tool_use / tool_result pairs.
+
+    Bedrock enforces: every tool_result must have a tool_use with the same
+    tool_use_id in the immediately preceding assistant message. Trimming
+    naively (e.g. messages[:1] + messages[-N:]) can cut the tool_use while
+    keeping the tool_result, causing:
+      ValidationException: unexpected tool_use_id found in tool_result blocks
+
+    Strategy:
+      1. Always keep the first message (original user request).
+      2. Walk backwards from the end, accumulating messages.
+      3. When we see a tool_result (ToolMessage), also keep the preceding
+         assistant message that contains the matching tool_use — even if it
+         would otherwise be trimmed.
+      4. Stop once we have `target` messages.
+
+    This guarantees no orphaned tool_result messages.
+    """
+    if len(messages) <= target:
+        return messages
+
+    # Always keep the first message (initial user request)
+    first   = messages[:1]
+    rest    = messages[1:]
+    kept    = []
+    budget  = target - 1  # -1 for the first message we always keep
+
+    # Walk backwards through rest so we take the most recent messages
+    i = len(rest) - 1
+    while i >= 0 and len(kept) < budget:
+        msg = rest[i]
+
+        # Detect message type
+        msg_type = type(msg).__name__  # HumanMessage, AIMessage, ToolMessage
+
+        if msg_type == "ToolMessage":
+            # This is a tool_result. We must also keep the preceding assistant
+            # message (tool_use) even if it pushes us over budget slightly.
+            kept.insert(0, msg)
+            # Look backwards for the preceding assistant message
+            if i > 0:
+                prev = rest[i - 1]
+                prev_type = type(prev).__name__
+                if prev_type == "AIMessage":
+                    kept.insert(0, prev)
+                    i -= 2
+                    continue
+        else:
+            kept.insert(0, msg)
+
+        i -= 1
+
+    return first + kept
+
+
 # ── Graph construction ─────────────────────────────────────────────────────────
 
 def build_graph(
@@ -178,10 +238,13 @@ def build_graph(
                 f"findings {counts.get('record_finding',0)}/{BUDGET_FINDINGS})"
             )
 
-        # Context trimming — keep first message + most recent N messages
+        # Context trimming — must preserve tool_use / tool_result pairs.
+        # Bedrock rejects any tool_result whose tool_use was trimmed away.
+        # Simple slice trimming (messages[:1] + messages[-N:]) can break
+        # pairs and causes ValidationException: unexpected tool_use_id.
         messages = state["messages"]
         if len(messages) > MAX_CONTEXT_MESSAGES:
-            messages = messages[:1] + messages[-(MAX_CONTEXT_MESSAGES - 1):]
+            messages = _trim_messages_safe(messages, MAX_CONTEXT_MESSAGES)
             if verbose:
                 print(f"   [Context trimmed to {len(messages)} messages]")
 
@@ -210,15 +273,23 @@ def build_graph(
                     "throttling", "throttle", "too many tokens",
                     "rate limit", "too many requests", "503",
                 ))
-                if is_throttle and attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)
-                    print(f"\n   ⏳ Throttled — waiting {delay}s (attempt {attempt+1}/{max_retries})\n")
-                    time.sleep(delay)
-                    if attempt >= 1:
-                        # Trim context more aggressively on repeated throttling
-                        trim_to = max(20, MAX_CONTEXT_MESSAGES - 10 * attempt)
-                        messages = messages[:1] + messages[-(trim_to - 1):]
-                        full_messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+                # ValidationException with tool_use_id mismatch means the
+                # context was trimmed unsafely in a previous retry attempt.
+                # Trim again using the safe trimmer and retry.
+                is_validation = "validationexception" in err and "tool_use_id" in err
+
+                if (is_throttle or is_validation) and attempt < max_retries - 1:
+                    if is_throttle:
+                        delay = base_delay * (2 ** attempt)
+                        print(f"\n   ⏳ Throttled — waiting {delay}s (attempt {attempt+1}/{max_retries})\n")
+                        time.sleep(delay)
+                    else:
+                        print(f"\n   ⚠️  ValidationException (tool_use_id mismatch) — re-trimming context\n")
+
+                    # Always trim safely on any retry
+                    trim_to = max(20, MAX_CONTEXT_MESSAGES - 10 * (attempt + 1))
+                    messages = _trim_messages_safe(messages, trim_to)
+                    full_messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
                     continue
                 raise
 
