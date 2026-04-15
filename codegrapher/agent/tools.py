@@ -3,31 +3,36 @@ Agent tool definitions with call budget enforcement and quality gates.
 
 Changes from original
 ----------------------
-1. make_tools() now accepts file_budget, search_budget, finding_budget.
+1. scan_repository uses detect() from graphify instead of its own os.walk.
+   detect() already handles skip lists, .graphifyignore, sensitive file
+   skipping, and incremental scanning. scan_repository now calls it once
+   and stores the result in state_accumulator["detection"].
+
+2. extract_ast_graph reuses state_accumulator["detection"] set by
+   scan_repository. No second filesystem walk. detect() is never called
+   more than once per run.
+
+3. make_tools() accepts file_budget, search_budget, finding_budget.
    Budgets are enforced inside read_file, search_code, record_finding.
    When exhausted the tool returns BUDGET_EXHAUSTED — the agent cannot
    exceed the limit no matter what the system prompt says.
 
-2. record_finding has a quality gate.
+4. record_finding has a quality gate.
    Findings with fewer than 3 sentences are REJECTED with an explanation
    of what is missing. This forces WHAT/WHY/CONSEQUENCE/HOW.
 
-3. finish_analysis has a completeness gate.
+5. finish_analysis has a completeness gate.
    Prevents premature termination before minimum exploration is done.
 
-4. Tool docstrings are LLM instructions, not developer docs.
+6. Tool docstrings are LLM instructions, not developer docs.
    They tell the LLM WHEN to call the tool and WHAT to do with the result.
 
-5. analyze_graph return value is actionable, not just raw JSON.
+7. analyze_graph return value is actionable, not just raw JSON.
    It explicitly tells the agent which files to investigate next.
-
-6. _call_counts tracked in state_accumulator["_call_counts"].
-   Visible in verbose output so developers can see tool usage.
 """
 from __future__ import annotations
 
 import fnmatch
-import json
 import os
 import re
 from pathlib import Path
@@ -36,7 +41,7 @@ from typing import Optional
 from langchain_core.tools import tool
 
 
-# ── Skip lists ─────────────────────────────────────────────────────────────────
+# ── Skip lists (used by search_code and _build_tree) ──────────────────────────
 
 _SKIP_DIRS = frozenset({
     ".git", ".svn", "node_modules", "__pycache__", ".pytest_cache",
@@ -51,12 +56,6 @@ _SKIP_EXTS = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".svg",
     ".zip", ".tar", ".gz", ".whl", ".egg",
     ".lock", ".snap", ".map",
-})
-
-_CODE_EXTS = frozenset({
-    ".py", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs",
-    ".go", ".rs", ".java", ".rb", ".cs", ".kt", ".swift",
-    ".cpp", ".c", ".h", ".hpp", ".sh",
 })
 
 
@@ -141,59 +140,64 @@ def make_tools(
           - Identify entry point files (index.js, main.py, boot.js, app.ts)
           - Plan which files to spend your read_file budget on
         """
-        ext_counts: dict[str, int] = {}
-        total_files = 0
-        total_lines = 0
-        large_files = []
+        # Use detect() from graphify — it already handles:
+        #   - skip lists (node_modules, venv, .git, dist, build ...)
+        #   - .graphifyignore support
+        #   - sensitive file skipping (.env, .pem, credentials)
+        #   - incremental scanning support
+        # No need to re-walk the filesystem ourselves.
+        try:
+            from codegrapher.core.detect import detect
+            detection = detect(root)
+        except Exception as e:
+            return f"ERROR running detect: {e}"
 
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in _SKIP_DIRS and (
-                    not d.startswith(".") or d in _ALLOW_HIDDEN
-                )
-            ]
-            for fname in filenames:
-                fp = Path(dirpath) / fname
-                if any(fname.endswith(e) for e in _SKIP_EXTS):
-                    continue
-                ext = fp.suffix.lower() or "(none)"
-                try:
-                    size = fp.stat().st_size
-                except OSError:
-                    continue
-                ext_counts[ext] = ext_counts.get(ext, 0) + 1
-                total_files += 1
+        code_files = [Path(f) for f in detection.get("files", {}).get("code", [])]
+        total_files = detection.get("total_files", 0)
+        total_words = detection.get("total_words", 0)
+        warning     = detection.get("warning")
+
+        # detect() groups by type (code/doc/image) not by extension.
+        # Compute extension breakdown and largest files from the code file list —
+        # these are the two things detect() does not provide that the agent needs.
+        ext_counts: dict[str, int] = {}
+        large_files: list[tuple[int, str]] = []
+
+        for fp in code_files:
+            ext = fp.suffix.lower() or "(none)"
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+            try:
+                size = fp.stat().st_size
                 large_files.append((size, str(fp.relative_to(root))))
-                if fp.suffix.lower() in _CODE_EXTS:
-                    try:
-                        total_lines += fp.read_text(errors="replace").count("\n")
-                    except Exception:
-                        pass
+            except OSError:
+                pass
 
         large_files.sort(reverse=True)
         top_exts = dict(sorted(ext_counts.items(), key=lambda x: x[1], reverse=True)[:12])
 
+        # Store detection result so extract_ast_graph can reuse it directly
+        # — no second filesystem walk needed.
+        state_accumulator["detection"] = detection
         state_accumulator["scan_result"] = {
             "total_files":   total_files,
-            "total_lines":   total_lines,
+            "total_words":   total_words,
             "by_extension":  top_exts,
             "largest_files": [{"size_bytes": s, "path": p} for s, p in large_files[:10]],
             "directory_tree": _build_tree(root) if include_tree else "",
         }
 
-        return (
-            f"Repository: {total_files:,} files, {total_lines:,} lines\n\n"
-            f"Languages:\n"
+        output = f"Repository: {total_files:,} files, {total_words:,} words\n"
+        if warning:
+            output += f"⚠ {warning}\n"
+        output += (
+            "\nLanguages (code files by extension):\n"
             + "\n".join(f"  {e}: {c}" for e, c in list(top_exts.items())[:8])
-            + f"\n\nLargest files (candidates for read_file):\n"
-            + "\n".join(
-                f"  {p} ({s//1024}KB)"
-                for s, p in large_files[:6]
-            )
-            + (f"\n\nDirectory tree:\n{state_accumulator['scan_result']['directory_tree']}"
-               if include_tree else "")
+            + "\n\nLargest files (candidates for read_file):\n"
+            + "\n".join(f"  {p} ({s//1024}KB)" for s, p in large_files[:6])
         )
+        if include_tree:
+            output += f"\n\nDirectory tree:\n{state_accumulator['scan_result']['directory_tree']}"
+        return output
 
     # ── Pipeline tool 2: extract_ast_graph ────────────────────────────────────
     @tool
@@ -206,14 +210,18 @@ def make_tools(
         modules and their import/call relationships.
         """
         try:
-            from codegrapher.core.detect  import detect
             from codegrapher.core.extract import collect_files, extract as gf_extract
             from codegrapher.core.build   import build_from_json
         except ImportError as e:
             return f"ERROR: graphify not installed — {e}"
 
+        # Reuse the detection result stored by scan_repository.
+        # This avoids a second full filesystem walk.
+        detection = state_accumulator.get("detection")
+        if detection is None:
+            return "ERROR: Call scan_repository first — detection result not found."
+
         try:
-            detection      = detect(root)
             code_files_raw = detection.get("files", {}).get("code", [])
             code_files     = []
             for f in code_files_raw:
@@ -229,7 +237,6 @@ def make_tools(
 
             result = gf_extract(code_files)
             state_accumulator["graphify_ast"] = result
-            state_accumulator["detection"]    = detection
 
             nodes = result.get("nodes", [])
             edges = result.get("edges", [])
