@@ -45,22 +45,18 @@ def run_pipeline(args: Namespace) -> None:
     print(f"\n🤖 Starting LangGraph agentic analysis...")
     print(f"   Repository  : {args.repo_path.resolve()}")
     print(f"   Max steps   : {getattr(args, 'max_iterations', 50)}")
-    print(f"\n   Agent will autonomously:")
-    print(f"   → scan_repository → build_code_graph (AST + clustering + diagrams in one call)")
-    print(f"   → Read key files in parallel batches (read_multiple_files)")
-    print(f"   → Search for patterns + record findings (batched)")
-    print(f"   → finish_analysis with executive summary\n")
+    print(f"\n   Phase 1 (deterministic): scan → AST graph → community detection → key files → searches")
+    print(f"   Phase 2 (1 LLM call):   full context → complete JSON analysis\n")
 
     try:
-        from codegrapher.agent.graph import run_agent
-        state_accumulator, final_state = run_agent(
+        from codegrapher.agent.graph import run_single_call_analysis
+        state_accumulator, final_state = run_single_call_analysis(
             llm=llm,
             repo_root=args.repo_path,
-            max_iterations=getattr(args, "max_iterations", 50),
             verbose=True,
         )
     except Exception as e:
-        print(f"error during agentic loop: {e}", file=sys.stderr)
+        print(f"error during analysis: {e}", file=sys.stderr)
         if getattr(args, "verbose", False):
             import traceback
             traceback.print_exc()
@@ -70,14 +66,11 @@ def run_pipeline(args: Namespace) -> None:
     diagrams_raw = state_accumulator.get("diagrams", [])
     iteration = final_state.get("iteration", 0)
 
-    print(f"\n   ✅ Agent completed:")
-    print(f"      Steps        : {iteration}")
+    print(f"\n   ✅ Analysis completed:")
+    print(f"      LLM calls    : {iteration}")
     print(f"      Findings     : {len(findings)}")
     print(f"      God nodes    : {len(state_accumulator.get('god_nodes', []))}")
     print(f"      Communities  : {len(state_accumulator.get('communities', {}))}")
-
-    if not state_accumulator.get("finished"):
-        print("      ⚠️  finish_analysis not called — report may be partial")
 
     # ── 3. Generate diagrams from real graph data ─────────────────────────────
     print("\n📊 Generating diagrams from graph data...")
