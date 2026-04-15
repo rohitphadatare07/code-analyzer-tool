@@ -1,23 +1,28 @@
 """
-LangGraph tool definitions.
+Agent tool definitions with call budget enforcement and quality gates.
 
-These tools wrap graphify's Python libraries so the LangGraph agent
-can call them via tool-use. The agent DECIDES which tools to call —
-it is not hard-coded to call them in order.
+Changes from original
+----------------------
+1. make_tools() now accepts file_budget, search_budget, finding_budget.
+   Budgets are enforced inside read_file, search_code, record_finding.
+   When exhausted the tool returns BUDGET_EXHAUSTED — the agent cannot
+   exceed the limit no matter what the system prompt says.
 
-Tools available to the agent:
-  1. scan_repository        - detect files + build dir tree
-  2. build_code_graph       - AST extraction + clustering + analysis + diagrams (all-in-one)
-  3. read_file              - read a specific file (agent decides which)
-  4. read_multiple_files    - read up to 5 files in a single call (use instead of looping read_file)
-  5. search_code            - grep across the repo
-  6. record_finding         - save an insight
-  7. finish_analysis        - signal completion with executive summary
+2. record_finding has a quality gate.
+   Findings with fewer than 3 sentences are REJECTED with an explanation
+   of what is missing. This forces WHAT/WHY/CONSEQUENCE/HOW.
 
-Design principle: minimize LLM round-trips by batching sequential/parallel work.
-  - build_code_graph replaces 4 sequential single-step tools (saves ~3 LLM calls)
-  - read_multiple_files replaces N individual read_file calls (saves N-1 LLM calls)
-  - The agent should return multiple tool_calls per response when operations are independent
+3. finish_analysis has a completeness gate.
+   Prevents premature termination before minimum exploration is done.
+
+4. Tool docstrings are LLM instructions, not developer docs.
+   They tell the LLM WHEN to call the tool and WHAT to do with the result.
+
+5. analyze_graph return value is actionable, not just raw JSON.
+   It explicitly tells the agent which files to investigate next.
+
+6. _call_counts tracked in state_accumulator["_call_counts"].
+   Visible in verbose output so developers can see tool usage.
 """
 from __future__ import annotations
 
@@ -25,36 +30,41 @@ import fnmatch
 import json
 import os
 import re
-import sys
 from pathlib import Path
 from typing import Optional
 
 from langchain_core.tools import tool
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+# ── Skip lists ─────────────────────────────────────────────────────────────────
 
-_SKIP_DIRS = {
+_SKIP_DIRS = frozenset({
     ".git", ".svn", "node_modules", "__pycache__", ".pytest_cache",
-    ".mypy_cache", "venv", ".venv", "env", "dist", "build",
-    ".next", ".nuxt", "coverage", ".tox", ".idea", ".vscode",
-}
+    ".mypy_cache", "venv", ".venv", "env", ".tox",
+    "dist", "build", ".next", ".nuxt", "coverage", ".idea", ".vscode", ".yarn",
+})
 
-_SKIP_EXTS = {
+_ALLOW_HIDDEN = frozenset({".github", ".gitlab-ci", ".circleci"})
+
+_SKIP_EXTS = frozenset({
     ".pyc", ".pyo", ".class", ".o", ".so", ".dylib",
-    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp",
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".svg",
     ".zip", ".tar", ".gz", ".whl", ".egg",
-}
+    ".lock", ".snap", ".map",
+})
 
-_CODE_EXTS = {
-    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java",
-    ".rb", ".cpp", ".c", ".h", ".cs", ".kt", ".swift", ".sh",
-}
+_CODE_EXTS = frozenset({
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs",
+    ".go", ".rs", ".java", ".rb", ".cs", ".kt", ".swift",
+    ".cpp", ".c", ".h", ".hpp", ".sh",
+})
 
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _safe_resolve(repo_root: Path, rel_path: str) -> Path:
     p = (repo_root / rel_path).resolve()
-    if not str(p).startswith(str(repo_root)):
+    if not str(p).startswith(str(repo_root.resolve())):
         raise ValueError(f"Path escapes repo root: {rel_path}")
     return p
 
@@ -69,114 +79,143 @@ def _build_tree(root: Path, max_depth: int = 4) -> str:
             entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name))
         except PermissionError:
             return
-        entries = [e for e in entries if e.name not in _SKIP_DIRS and not e.name.startswith(".")]
+        entries = [
+            e for e in entries
+            if e.name not in _SKIP_DIRS and (
+                not e.name.startswith(".") or e.name in _ALLOW_HIDDEN
+            )
+        ]
         for i, entry in enumerate(entries[:25]):
-            is_last = i == len(entries) - 1
-            connector = "└── " if is_last else "├── "
+            is_last   = i == len(entries) - 1
+            connector = "`-- " if is_last else "|-- "
             lines.append(f"{prefix}{connector}{entry.name}{'/' if entry.is_dir() else ''}")
             if entry.is_dir() and depth < max_depth:
-                _walk(entry, prefix + ("    " if is_last else "│   "), depth + 1)
+                _walk(entry, prefix + ("    " if is_last else "|   "), depth + 1)
 
     _walk(root, "", 1)
     return "\n".join(lines)
 
 
-# ── Tool factory ──────────────────────────────────────────────────────────────
-# We return bound tools so each tool closure captures the repo_root.
+def _budget_remaining(counts: dict, key: str, budget: int) -> str:
+    used = counts.get(key, 0)
+    return f"[{key}: {budget - used}/{budget} remaining]"
 
-def make_tools(repo_root: Path, state_accumulator: dict) -> list:
+
+def _budget_exhausted(tool_name: str, budget: int) -> str:
+    return (
+        f"BUDGET_EXHAUSTED: {tool_name} budget ({budget} calls) is used up. "
+        f"Do not call {tool_name} again. "
+        f"Proceed with what you have gathered — call finish_analysis."
+    )
+
+
+# ── Tool factory ───────────────────────────────────────────────────────────────
+
+def make_tools(
+    repo_root:         Path,
+    state_accumulator: dict,
+    file_budget:    int = 6,
+    search_budget:  int = 4,
+    finding_budget: int = 15,
+) -> list:
     """
-    Build the tool list bound to a specific repo_root.
-
-    state_accumulator is a mutable dict the tools write into:
-      - findings: list of Finding dicts
-      - diagrams: list of Diagram dicts
-      - finish_data: dict with summary/purpose/architecture_style
-      - finished: bool
-      - graphify_output: GraphifyOutput dict (written by extract/cluster tools)
+    Create all agent tools as closures over repo_root, state_accumulator,
+    and budget limits. Budget counters live in state_accumulator["_call_counts"].
     """
-    root = repo_root.resolve()
+    root   = repo_root.resolve()
+    counts = state_accumulator.setdefault("_call_counts", {
+        "read_file": 0, "search_code": 0, "record_finding": 0,
+    })
 
-    # ── 1. scan_repository ────────────────────────────────────────────────────
+    # ── Pipeline tool 1: scan_repository ──────────────────────────────────────
     @tool
     def scan_repository(include_tree: bool = True) -> str:
         """
-        Scan the repository: count files by type, measure corpus size, build
-        directory tree. Always call this FIRST before reading any files.
-        Returns JSON with file counts, word counts, and optionally the dir tree.
+        Scan the repository structure. Call this FIRST and ONLY ONCE.
+
+        Returns file counts by language, largest files, directory tree.
+
+        After reading the output:
+          - Identify the project type (Node.js, Python, Go, Java...)
+          - Note the largest files — they usually contain core logic
+          - Identify entry point files (index.js, main.py, boot.js, app.ts)
+          - Plan which files to spend your read_file budget on
         """
         ext_counts: dict[str, int] = {}
         total_files = 0
-        total_words = 0
+        total_lines = 0
         large_files = []
 
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [
                 d for d in dirnames
-                if d not in _SKIP_DIRS and not d.startswith(".")
+                if d not in _SKIP_DIRS and (
+                    not d.startswith(".") or d in _ALLOW_HIDDEN
+                )
             ]
             for fname in filenames:
                 fp = Path(dirpath) / fname
                 if any(fname.endswith(e) for e in _SKIP_EXTS):
                     continue
-                ext = fp.suffix.lower() or "none"
-                size = fp.stat().st_size
+                ext = fp.suffix.lower() or "(none)"
+                try:
+                    size = fp.stat().st_size
+                except OSError:
+                    continue
                 ext_counts[ext] = ext_counts.get(ext, 0) + 1
                 total_files += 1
                 large_files.append((size, str(fp.relative_to(root))))
-                if ext in _CODE_EXTS:
+                if fp.suffix.lower() in _CODE_EXTS:
                     try:
-                        total_words += fp.read_text(errors="replace").count(" ")
+                        total_lines += fp.read_text(errors="replace").count("\n")
                     except Exception:
                         pass
 
         large_files.sort(reverse=True)
-        result = {
-            "total_files": total_files,
-            "total_words": total_words,
-            "by_extension": dict(sorted(ext_counts.items(), key=lambda x: x[1], reverse=True)[:20]),
-            "largest_files": [{"size": s, "path": p} for s, p in large_files[:10]],
+        top_exts = dict(sorted(ext_counts.items(), key=lambda x: x[1], reverse=True)[:12])
+
+        state_accumulator["scan_result"] = {
+            "total_files":   total_files,
+            "total_lines":   total_lines,
+            "by_extension":  top_exts,
+            "largest_files": [{"size_bytes": s, "path": p} for s, p in large_files[:10]],
+            "directory_tree": _build_tree(root) if include_tree else "",
         }
-        if include_tree:
-            result["directory_tree"] = _build_tree(root)
 
-        state_accumulator["scan_result"] = result
-        return json.dumps(result, indent=2)
-
-    # ── 2. build_code_graph ───────────────────────────────────────────────────
-    @tool
-    def build_code_graph() -> str:
-        """
-        Run the full graphify pipeline in one shot:
-          1. AST extraction (tree-sitter) — extracts classes, functions, imports, calls
-          2. Community detection (Leiden/Louvain) — groups related code into clusters
-          3. Graph analysis — finds god nodes and surprising cross-community connections
-          4. Diagram generation — produces architecture/flow/component Mermaid diagrams
-
-        Call this ONCE after scan_repository. It replaces the four separate steps
-        (extract_ast_graph, cluster_communities, analyze_graph, generate_diagrams_from_graph)
-        with a single LLM round-trip.
-
-        Returns a combined summary: nodes, edges, communities, god nodes, and diagram status.
-        """
-        # ── Step 1: AST extraction ────────────────────────────────────────────
-        try:
-            from codegrapher.core.detect import detect
-            from codegrapher.core.extract import collect_files, extract as gf_extract
-            from codegrapher.core.build import build_from_json
-            from codegrapher.core.cluster import cluster, score_all
-            from codegrapher.core.analyze import (
-                god_nodes as gf_god_nodes,
-                surprising_connections,
-                suggest_questions,
+        return (
+            f"Repository: {total_files:,} files, {total_lines:,} lines\n\n"
+            f"Languages:\n"
+            + "\n".join(f"  {e}: {c}" for e, c in list(top_exts.items())[:8])
+            + f"\n\nLargest files (candidates for read_file):\n"
+            + "\n".join(
+                f"  {p} ({s//1024}KB)"
+                for s, p in large_files[:6]
             )
-        except ImportError:
-            return json.dumps({"error": "graphify not installed. Run: pip install graphifyy"})
+            + (f"\n\nDirectory tree:\n{state_accumulator['scan_result']['directory_tree']}"
+               if include_tree else "")
+        )
+
+    # ── Pipeline tool 2: extract_ast_graph ────────────────────────────────────
+    @tool
+    def extract_ast_graph() -> str:
+        """
+        Extract the dependency graph using tree-sitter AST parsing.
+        Call ONCE, AFTER scan_repository, BEFORE cluster_communities.
+
+        Parses all source files and builds a graph of classes, functions,
+        modules and their import/call relationships.
+        """
+        try:
+            from codegrapher.core.detect  import detect
+            from codegrapher.core.extract import collect_files, extract as gf_extract
+            from codegrapher.core.build   import build_from_json
+        except ImportError as e:
+            return f"ERROR: graphify not installed — {e}"
 
         try:
-            detection = detect(root)
+            detection      = detect(root)
             code_files_raw = detection.get("files", {}).get("code", [])
-            code_files = []
+            code_files     = []
             for f in code_files_raw:
                 p = Path(f)
                 if p.is_dir():
@@ -186,116 +225,176 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
 
             if not code_files:
                 state_accumulator["graphify_ast"] = {"nodes": [], "edges": []}
-                return json.dumps({"message": "No code files found", "nodes": 0, "edges": 0})
+                return "No code files found."
 
-            ast_result = gf_extract(code_files)
-            state_accumulator["graphify_ast"] = ast_result
-            state_accumulator["detection"] = detection
+            result = gf_extract(code_files)
+            state_accumulator["graphify_ast"] = result
+            state_accumulator["detection"]    = detection
 
+            nodes = result.get("nodes", [])
+            edges = result.get("edges", [])
+
+            # Compute top nodes by connection count for agent planning
+            deg: dict[str, int] = {}
+            for e in edges:
+                deg[e.get("source","")] = deg.get(e.get("source",""),0) + 1
+                deg[e.get("target","")] = deg.get(e.get("target",""),0) + 1
+            top = sorted(deg.items(), key=lambda x: x[1], reverse=True)[:5]
+
+            return (
+                f"Graph extracted: {len(nodes):,} nodes, {len(edges):,} edges "
+                f"from {len(code_files):,} files\n\n"
+                f"Most-connected nodes (likely architectural bottlenecks):\n"
+                + "\n".join(f"  {nid}: {d} connections" for nid, d in top)
+                + "\n\nNext step: cluster_communities"
+            )
         except Exception as e:
-            return json.dumps({"error": f"AST extraction failed: {e}"})
+            return f"ERROR: {e}"
 
-        # ── Step 2: Community detection ───────────────────────────────────────
+    # ── Pipeline tool 3: cluster_communities ──────────────────────────────────
+    @tool
+    def cluster_communities() -> str:
+        """
+        Detect semantic communities using Leiden/Louvain algorithm.
+        Call ONCE, AFTER extract_ast_graph, BEFORE analyze_graph.
+
+        Groups related nodes into communities representing natural
+        architectural boundaries (layers, bounded contexts, modules).
+
+        Communities with low cohesion (<20%) contain unrelated code
+        that ended up together — investigate why.
+        """
         try:
-            G = build_from_json(ast_result)
+            from codegrapher.core.cluster import cluster, score_all
+            from codegrapher.core.build   import build_from_json
+        except ImportError as e:
+            return f"ERROR: {e}"
+
+        ast_data = state_accumulator.get("graphify_ast")
+        if not ast_data:
+            return "ERROR: Call extract_ast_graph first."
+
+        try:
+            G           = build_from_json(ast_data)
             communities = cluster(G)
-            cohesion = score_all(G, communities)
+            cohesion    = score_all(G, communities)
 
             labels: dict[int, str] = {}
             for cid, node_ids in communities.items():
-                sources = [
-                    G.nodes[n].get("source_file", "") for n in node_ids if n in G.nodes
-                ]
+                sources = [G.nodes[n].get("source_file","") for n in node_ids if n in G.nodes]
                 sources = [s for s in sources if s]
                 if sources:
-                    tops = [Path(s).parts[0] if Path(s).parts else s for s in sources]
-                    labels[cid] = max(set(tops), key=tops.count)
+                    parts = [Path(s).parts[0] if Path(s).parts else s for s in sources]
+                    labels[cid] = max(set(parts), key=parts.count)
                 else:
                     labels[cid] = f"Community {cid}"
 
-            state_accumulator["graph"] = G
-            state_accumulator["communities"] = communities
-            state_accumulator["cohesion"] = cohesion
+            state_accumulator["graph"]            = G
+            state_accumulator["communities"]      = communities
+            state_accumulator["cohesion"]         = cohesion
             state_accumulator["community_labels"] = labels
 
-        except Exception as e:
-            return json.dumps({"error": f"Community detection failed: {e}"})
+            lines = [f"{len(communities)} communities detected:\n"]
+            for cid, nids in sorted(communities.items(), key=lambda x: len(x[1]), reverse=True):
+                coh  = cohesion.get(cid, 0)
+                lbl  = labels.get(cid, f"C{cid}")
+                flag = " ← LOW COHESION — investigate" if coh < 0.2 and len(nids) >= 3 else ""
+                lines.append(f"  Community {cid} [{lbl}]: {len(nids)} nodes, {coh:.0%} cohesion{flag}")
 
-        # ── Step 3: Graph analysis ────────────────────────────────────────────
-        try:
-            god = gf_god_nodes(G, top_n=10)
-            surprises = surprising_connections(G, communities, top_n=5)
-            questions = suggest_questions(G, communities, labels, top_n=5)
-
-            state_accumulator["god_nodes"] = god
-            state_accumulator["surprising_connections"] = surprises
-            state_accumulator["suggested_questions"] = questions
+            lines.append("\nNext step: analyze_graph")
+            return "\n".join(lines)
 
         except Exception as e:
-            god, surprises, questions = [], [], []
-            state_accumulator["god_nodes"] = []
-            state_accumulator["surprising_connections"] = []
-            state_accumulator["suggested_questions"] = []
+            return f"ERROR: {e}"
 
-        # ── Step 4: Diagram generation ────────────────────────────────────────
-        diagrams_summary = []
-        try:
-            from codegrapher.output.mermaid_converter import generate_all_diagrams
-            diagrams = generate_all_diagrams(state_accumulator)
-            state_accumulator["diagrams"] = diagrams
-            diagrams_summary = [
-                {"type": d["diagram_type"], "lines": d["mermaid_code"].count("\n") + 1}
-                for d in diagrams
-            ]
-        except Exception as e:
-            diagrams_summary = [{"error": str(e)}]
-
-        # ── Combined result ───────────────────────────────────────────────────
-        top_communities = [
-            {
-                "id": cid,
-                "label": labels.get(cid, f"Community {cid}"),
-                "size": len(node_ids),
-                "cohesion": cohesion.get(cid, 0.0),
-            }
-            for cid, node_ids in sorted(communities.items(), key=lambda x: len(x[1]), reverse=True)[:8]
-        ]
-
-        return json.dumps({
-            "ast": {
-                "nodes": len(ast_result.get("nodes", [])),
-                "edges": len(ast_result.get("edges", [])),
-                "files_processed": len(code_files),
-                "sample_nodes": [
-                    {"id": n["id"], "label": n.get("label", ""), "file": n.get("source_file", "")}
-                    for n in ast_result.get("nodes", [])[:6]
-                ],
-            },
-            "communities": {
-                "total_nodes": G.number_of_nodes(),
-                "total_edges": G.number_of_edges(),
-                "count": len(communities),
-                "top": top_communities,
-            },
-            "god_nodes": god[:5],
-            "surprising_connections": surprises[:3],
-            "suggested_questions": questions[:3],
-            "diagrams_generated": diagrams_summary,
-        }, indent=2)
-
-    # ── 3. read_file ──────────────────────────────────────────────────────────
+    # ── Pipeline tool 4: analyze_graph ────────────────────────────────────────
     @tool
-    def read_file(path: str, max_lines: int = 300) -> str:
+    def analyze_graph() -> str:
         """
-        Read a specific file in the repository.
-        Use this to deeply understand key files the agent identifies as important.
-        The agent decides which files to read based on its exploration.
+        Find architectural patterns: god nodes and surprising connections.
+        Call ONCE, AFTER cluster_communities.
+
+        God nodes = files with unusually high connectivity.
+        Surprising connections = unexpected cross-community edges.
+
+        IMPORTANT: After reading this output, use your read_file budget
+        on the god nodes listed. They are the architectural core.
+        Surprising connections are architectural concerns — investigate them.
+        """
+        try:
+            from codegrapher.core.analyze import god_nodes as gf_god_nodes, surprising_connections
+        except ImportError as e:
+            return f"ERROR: {e}"
+
+        G           = state_accumulator.get("graph")
+        communities = state_accumulator.get("communities")
+        labels      = state_accumulator.get("community_labels", {})
+
+        if G is None or communities is None:
+            return "ERROR: Call cluster_communities first."
+
+        try:
+            god      = gf_god_nodes(G, top_n=8)
+            surprise = surprising_connections(G, communities, top_n=5)
+
+            state_accumulator["god_nodes"]              = god
+            state_accumulator["surprising_connections"] = surprise
+
+            # Make output explicitly actionable — tell agent what to do next
+            lines = [f"God nodes — use your read_file budget on these:\n"]
+            for g in god[:5]:
+                src = G.nodes.get(g["id"], {}).get("source_file", "?")
+                lines.append(
+                    f"  {g.get('label', g['id'])} — {g.get('edges','?')} connections\n"
+                    f"    → read_file('{src}')"
+                )
+
+            if surprise:
+                lines.append("\nSurprising cross-community connections — investigate these:\n")
+                for s in surprise[:4]:
+                    lines.append(
+                        f"  {s.get('source','')} → {s.get('target','')} "
+                        f"— {s.get('why','crosses community boundaries')}\n"
+                        f"    → Read both files to understand if this is accidental coupling"
+                    )
+
+            lines.append(f"\nNext: generate_diagrams_from_graph")
+            lines.append(f"Then spend your read_file budget on the god nodes above.")
+            return "\n".join(lines)
+
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    # ── Exploration tool 5: read_file ─────────────────────────────────────────
+    @tool
+    def read_file(path: str, max_lines: int = 200) -> str:
+        f"""
+        Read a file from the repository. Budget: {file_budget} calls total.
+
+        SPEND THIS BUDGET ON:
+          - God nodes listed by analyze_graph (highest architectural value)
+          - Files in surprising cross-community connections
+          - Entry points (index.js, main.py, boot.js, app.ts, manage.py)
+          - Files that failed a specific assessment check
+
+        DO NOT read files randomly. Every call must be motivated by a
+        specific finding from the pipeline tools.
+
+        AFTER READING: call record_finding immediately with what you learned.
+        Do not read multiple files before recording — record as you go.
 
         Args:
-            path: Relative file path within the repository.
-            max_lines: Maximum lines to return (default 300, max 500).
+            path:      Relative path from repo root
+            max_lines: Lines to read (default 200, max 400)
         """
-        max_lines = min(max_lines, 500)
+        # Budget enforcement
+        if counts.get("read_file", 0) >= file_budget:
+            return _budget_exhausted("read_file", file_budget)
+
+        counts["read_file"] = counts.get("read_file", 0) + 1
+        remaining = file_budget - counts["read_file"]
+
+        max_lines = min(max_lines, 400)
         try:
             resolved = _safe_resolve(root, path)
         except ValueError as e:
@@ -309,77 +408,51 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
         try:
             content = resolved.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
-            return f"ERROR: Cannot read {path}: {e}"
+            return f"ERROR: {e}"
 
         lines = content.split("\n")
         total = len(lines)
-        if total > max_lines:
-            content = "\n".join(lines[:max_lines])
-            content += f"\n\n... [{total - max_lines} more lines — increase max_lines to see more]"
+        excerpt = "\n".join(lines[:max_lines])
+        note    = f"\n[{total - max_lines} more lines — use max_lines={min(total,400)} to see more]" if total > max_lines else ""
 
-        return f"=== {path} ({total} lines total) ===\n{content}"
+        return (
+            f"=== {path} ({total} lines) ===\n\n{excerpt}{note}\n\n"
+            f"[read_file: {remaining}/{file_budget} calls remaining — "
+            f"record a finding about this file now]"
+        )
 
-    # ── 4b. read_multiple_files ───────────────────────────────────────────────
-    @tool
-    def read_multiple_files(paths: list, max_lines_each: int = 200) -> str:
-        """
-        Read up to 5 files in a single tool call.
-        Use this instead of calling read_file repeatedly — it saves LLM round-trips.
-
-        Args:
-            paths: List of relative file paths (max 5). e.g. ["main.py", "config.py", "models.py"]
-            max_lines_each: Max lines per file (default 200, max 300).
-        """
-        if not paths:
-            return "ERROR: No paths provided."
-        paths = paths[:5]  # hard cap
-        max_lines_each = min(max_lines_each, 300)
-
-        parts = []
-        for path in paths:
-            try:
-                resolved = _safe_resolve(root, path)
-            except ValueError as e:
-                parts.append(f"=== {path} ===\nERROR: {e}\n")
-                continue
-
-            if not resolved.exists():
-                parts.append(f"=== {path} ===\nERROR: File not found\n")
-                continue
-            if not resolved.is_file():
-                parts.append(f"=== {path} ===\nERROR: Not a file\n")
-                continue
-
-            try:
-                content = resolved.read_text(encoding="utf-8", errors="replace")
-                lines = content.split("\n")
-                total = len(lines)
-                if total > max_lines_each:
-                    content = "\n".join(lines[:max_lines_each])
-                    content += f"\n\n... [{total - max_lines_each} more lines]"
-                parts.append(f"=== {path} ({total} lines) ===\n{content}\n")
-            except Exception as e:
-                parts.append(f"=== {path} ===\nERROR: Cannot read: {e}\n")
-
-        return "\n".join(parts)
-
-    # ── 5. search_code ────────────────────────────────────────────────────────
+    # ── Exploration tool 6: search_code ───────────────────────────────────────
     @tool
     def search_code(
-        pattern: str,
-        file_glob: str = "*",
-        max_results: int = 30,
+        pattern:     str,
+        file_glob:   str = "*",
+        max_results: int = 15,
     ) -> str:
-        """
-        Search for a pattern across all code files in the repository.
-        Use this to trace how classes/functions/routes are used across files,
-        find all API endpoints, find database models, etc.
+        f"""
+        Search for a pattern across source files. Budget: {search_budget} calls total.
+
+        HIGH-VALUE searches (spend budget on these):
+          - All API routes: 'app\\.get|router\\.post|@GetMapping'
+          - DB model definitions: 'class.*Model|Schema\\('
+          - Config/env usage: 'process\\.env|os\\.environ'
+          - Verify a specific coupling: 'require.*knex|import.*db'
+
+        LOW-VALUE searches (do NOT waste budget on these):
+          - Things scan_repository already told you (file counts, languages)
+          - The same concept twice with different patterns
+          - General exploration ("security", "test", "cache")
 
         Args:
-            pattern: Text or regex pattern to search for.
-            file_glob: Glob pattern to filter files (e.g. '*.py', '*.ts').
-            max_results: Maximum number of matching lines to return.
+            pattern:     Regex or plain text
+            file_glob:   Limit to matching files (e.g. '*.ts', '*.py')
+            max_results: Max matches (default 15)
         """
+        if counts.get("search_code", 0) >= search_budget:
+            return _budget_exhausted("search_code", search_budget)
+
+        counts["search_code"] = counts.get("search_code", 0) + 1
+        remaining = search_budget - counts["search_code"]
+
         try:
             regex = re.compile(pattern, re.IGNORECASE)
         except re.error:
@@ -387,7 +460,12 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
 
         matches = []
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _SKIP_DIRS and (
+                    not d.startswith(".") or d in _ALLOW_HIDDEN
+                )
+            ]
             for fname in filenames:
                 if not fnmatch.fnmatch(fname, file_glob):
                     continue
@@ -398,7 +476,7 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
                     rel = str(fp.relative_to(root))
                     for i, line in enumerate(fp.read_text(errors="replace").split("\n"), 1):
                         if regex.search(line):
-                            matches.append(f"{rel}:{i}:  {line.strip()[:120]}")
+                            matches.append(f"{rel}:{i}  {line.strip()[:100]}")
                             if len(matches) >= max_results:
                                 break
                 except Exception:
@@ -406,108 +484,193 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
                 if len(matches) >= max_results:
                     break
 
-        if not matches:
-            return f"No matches found for pattern: {pattern}"
-        return f"Found {len(matches)} matches for '{pattern}':\n\n" + "\n".join(matches)
+        result = (
+            f"No matches for '{pattern}'"
+            if not matches else
+            f"{len(matches)} matches for '{pattern}':\n\n" + "\n".join(matches)
+        )
+        return result + f"\n\n[search_code: {remaining}/{search_budget} calls remaining]"
 
-    # ── 7. record_finding ─────────────────────────────────────────────────────
+    # ── Exploration tool 7: record_finding ────────────────────────────────────
     @tool
     def record_finding(
-        category: str,
-        title: str,
-        detail: str,
-        files: Optional[list] = None,
+        category:   str,
+        title:      str,
+        detail:     str,
+        files:      Optional[list] = None,
         confidence: str = "high",
     ) -> str:
-        """
-        Record an important finding about the codebase.
-        Call this whenever you discover something significant.
-        These findings are compiled into the final PDF report.
+        f"""
+        Record a finding. Budget: {finding_budget} calls total.
 
-        Args:
-            category: One of: architecture | component | data_flow | api_endpoint |
-                      security | tech_stack | design_pattern | code_quality |
-                      improvement | entry_point | dependency | database_model |
-                      testing | deployment | file_detail
-            title: Short title for this finding (used as heading in report).
-            detail: Full description of what you found.
-            files: List of relevant file paths.
-            confidence: high | medium | low
+        QUALITY REQUIREMENT — every finding needs all four elements:
+          WHAT:        What exactly did you find? Name the actual file/component.
+          WHY:         Why does this matter architecturally?
+          CONSEQUENCE: What breaks or cannot scale if unaddressed?
+          HOW:         Specific fix — name the exact AWS service or pattern.
+
+        Findings with fewer than 3 sentences are REJECTED.
+        Record IMMEDIATELY after each read_file or search_code result.
+
+        category: architecture | component | data_flow | api_endpoint |
+                  security | tech_stack | design_pattern | code_quality |
+                  improvement | entry_point | dependency | database_model |
+                  testing | deployment | file_detail |
+                  architecture_gap | cloud_readiness | modernization_target |
+                  security_risk
         """
-        finding = {
-            "category": category,
-            "title": title,
-            "detail": detail,
-            "files": files or [],
+        # Budget enforcement
+        if counts.get("record_finding", 0) >= finding_budget:
+            return _budget_exhausted("record_finding", finding_budget)
+
+        # Quality gate — reject thin findings
+        sentences = [s.strip() for s in re.split(r"[.!?]+", detail) if len(s.strip()) > 20]
+        if len(sentences) < 3:
+            return (
+                f"REJECTED: '{title}' — detail is too thin ({len(sentences)} sentence(s)).\n"
+                f"Rewrite with all four elements:\n"
+                f"  WHAT: what exactly did you find (name the file)?\n"
+                f"  WHY: why does this matter architecturally?\n"
+                f"  CONSEQUENCE: what breaks if not fixed?\n"
+                f"  HOW: specific fix with AWS service or design pattern name."
+            )
+
+        counts["record_finding"] = counts.get("record_finding", 0) + 1
+        remaining = finding_budget - counts["record_finding"]
+
+        state_accumulator.setdefault("findings", []).append({
+            "category":   category,
+            "title":      title,
+            "detail":     detail.strip(),
+            "files":      files or [],
             "confidence": confidence,
-        }
-        if "findings" not in state_accumulator:
-            state_accumulator["findings"] = []
-        state_accumulator["findings"].append(finding)
-        return f"✓ Finding recorded [{category}]: {title}"
+        })
 
-    # ── 7. finish_analysis ────────────────────────────────────────────────────
+        total = len(state_accumulator["findings"])
+        return (
+            f"✓ Finding #{total} [{category}]: {title}\n"
+            f"[record_finding: {remaining}/{finding_budget} calls remaining]"
+        )
+
+    # ── Pipeline tool 8: generate_diagrams_from_graph ─────────────────────────
+    @tool
+    def generate_diagrams_from_graph() -> str:
+        """
+        Generate architecture, flow, and component diagrams from the real graph.
+        Call ONCE, AFTER analyze_graph.
+
+        Diagrams are deterministic — same graph always produces the same result.
+        NEVER write Mermaid manually. Only call this once.
+        """
+        G = state_accumulator.get("graph")
+        if G is None:
+            return "ERROR: Call extract_ast_graph → cluster_communities → analyze_graph first."
+
+        try:
+            from codegrapher.output.mermaid_converter import generate_all_diagrams
+            diagrams = generate_all_diagrams(state_accumulator)
+            state_accumulator["diagrams"] = diagrams
+
+            return (
+                f"✓ {len(diagrams)} diagrams generated:\n"
+                + "\n".join(f"  [{d['diagram_type']}] {d['description'][:70]}" for d in diagrams)
+                + f"\n\nNow use your remaining exploration budget:\n"
+                f"  read_file:    {file_budget - counts.get('read_file',0)}/{file_budget} remaining\n"
+                f"  search_code:  {search_budget - counts.get('search_code',0)}/{search_budget} remaining\n"
+                f"Spend it on the god nodes from analyze_graph."
+            )
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    # ── Final tool 9: finish_analysis ─────────────────────────────────────────
     @tool
     def finish_analysis(
-        summary: str,
-        purpose: str,
-        architecture_style: str,
-        tech_stack: list,
-        key_components: list,
-        data_flow: list,
-        api_endpoints: list,
-        database_models: list,
-        security_notes: list,
-        improvement_suggestions: list,
-        testing_approach: str = "",
-        deployment_info: str = "",
-        code_quality_notes: list = None,
+        summary:                    str,
+        purpose:                    str,
+        architecture_style:         str,
+        tech_stack:                 list,
+        key_components:             list,
+        data_flow:                  list,
+        api_endpoints:              list,
+        database_models:            list,
+        security_notes:             list,
+        improvement_suggestions:    list,
+        testing_approach:           str  = "",
+        deployment_info:            str  = "",
+        code_quality_notes:         Optional[list] = None,
+        modernization_urgency:      str  = "",
+        target_architecture:        str  = "",
+        re_architecture_priorities: Optional[list] = None,
     ) -> str:
         """
-        Signal that analysis is complete and provide the executive summary.
-        Call this ONLY when you have: explored the structure, run extraction +
-        clustering + analysis, read key files, recorded findings, and generated
-        at least one diagram.
+        Complete the analysis. Call when you have genuine understanding.
+        Call earlier if your exploration budget is exhausted.
 
-        Args:
-            summary: 3-5 sentence technical summary of the codebase.
-            purpose: One sentence — what does this repo DO?
-            architecture_style: e.g. MVC, microservices, CLI tool, library, monolith.
-            tech_stack: List of technologies/frameworks/languages used.
-            key_components: List of dicts with name/description/files/responsibilities.
-            data_flow: List of steps describing main data flow.
-            api_endpoints: List of dicts with method/path/description.
-            database_models: List of data model names.
-            security_notes: List of security observations.
-            improvement_suggestions: List of concrete improvement ideas.
-            testing_approach: Description of testing strategy.
-            deployment_info: How this is deployed/run.
-            code_quality_notes: List of code quality observations.
+        Minimum requirements before calling:
+          ✓ All pipeline tools have run (graph, communities, diagrams)
+          ✓ At least 5 findings recorded
+          ✓ summary references specific files you actually read
+          ✓ key_components lists actual components you investigated
+
+        summary must be SPECIFIC — reference actual filenames and components.
+        Generic descriptions that could apply to any project are not acceptable.
         """
-        state_accumulator["finished"] = True
+        # Completeness gate
+        findings_count = len(state_accumulator.get("findings", []))
+        missing = []
+        if state_accumulator.get("graph") is None:
+            missing.append("graph not built (run extract_ast_graph → cluster_communities)")
+        if not state_accumulator.get("diagrams"):
+            missing.append("diagrams not generated (call generate_diagrams_from_graph)")
+        if findings_count < 5:
+            missing.append(f"only {findings_count} findings — need at least 5")
+        if not summary or len(summary.split()) < 20:
+            missing.append("summary too short — write at least 3 specific sentences")
+        if not key_components:
+            missing.append("key_components is empty — list actual components")
+
+        if missing:
+            return (
+                "CANNOT FINISH — missing:\n"
+                + "\n".join(f"  • {m}" for m in missing)
+            )
+
+        state_accumulator["finished"]    = True
         state_accumulator["finish_data"] = {
-            "summary": summary,
-            "purpose": purpose,
-            "architecture_style": architecture_style,
-            "tech_stack": tech_stack,
-            "key_components": key_components,
-            "data_flow": data_flow,
-            "api_endpoints": api_endpoints,
-            "database_models": database_models,
-            "security_notes": security_notes,
-            "improvement_suggestions": improvement_suggestions,
-            "testing_approach": testing_approach,
-            "deployment_info": deployment_info,
-            "code_quality_notes": code_quality_notes or [],
+            "summary":                   summary.strip(),
+            "purpose":                   purpose.strip(),
+            "architecture_style":        architecture_style,
+            "tech_stack":                tech_stack,
+            "key_components":            key_components,
+            "data_flow":                 data_flow,
+            "api_endpoints":             api_endpoints,
+            "database_models":           database_models,
+            "security_notes":            security_notes,
+            "improvement_suggestions":   improvement_suggestions,
+            "testing_approach":          testing_approach,
+            "deployment_info":           deployment_info,
+            "code_quality_notes":        code_quality_notes or [],
+            "modernization_urgency":     modernization_urgency,
+            "target_architecture":       target_architecture,
+            "re_architecture_priorities": re_architecture_priorities or [],
         }
-        return "✓ Analysis complete. Generating PDF report..."
+
+        total_calls = sum(counts.values()) + 5  # +5 pipeline tools
+        return (
+            f"✓ Analysis complete\n"
+            f"  Findings    : {findings_count}\n"
+            f"  Components  : {len(key_components)}\n"
+            f"  Total calls : ~{total_calls}"
+        )
 
     return [
         scan_repository,
-        build_code_graph,
+        extract_ast_graph,
+        cluster_communities,
+        analyze_graph,
         read_file,
-        read_multiple_files,
         search_code,
         record_finding,
+        generate_diagrams_from_graph,
         finish_analysis,
     ]

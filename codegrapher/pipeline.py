@@ -46,17 +46,18 @@ def run_pipeline(args: Namespace) -> None:
     print(f"   Repository  : {args.repo_path.resolve()}")
     print(f"   Max steps   : {getattr(args, 'max_iterations', 50)}")
     print(f"\n   Agent will autonomously:")
-    print(f"   → scan_repository → build_code_graph (AST + clustering + diagrams in one call)")
-    print(f"   → Read key files in parallel batches (read_multiple_files)")
-    print(f"   → Search for patterns + record findings (batched)")
-    print(f"   → finish_analysis with executive summary\n")
+    print(f"   → Run graphify AST extraction + Leiden clustering")
+    print(f"   → Decide which files to read")
+    print(f"   → Record findings as it explores")
+    print(f"   → Generate diagrams from real graph data")
+    print(f"   → Signal completion with executive summary\n")
 
     try:
         from codegrapher.agent.graph import run_agent
         state_accumulator, final_state = run_agent(
             llm=llm,
             repo_root=args.repo_path,
-            max_iterations=getattr(args, "max_iterations", 50),
+            max_iterations=getattr(args, "max_iterations", 35),
             verbose=True,
         )
     except Exception as e:
