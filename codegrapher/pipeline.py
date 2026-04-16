@@ -90,15 +90,14 @@ def run_pipeline(args: Namespace) -> None:
             state_accumulator=state_accumulator,
             messages=messages,
         )
-        if getattr(args, "verbose", False):
-            print(f"   Context size : {len(context):,} chars")
+        print(f"   Context size : {len(context):,} chars (~{len(context)//4} tokens)")
 
         finish_data = synthesise(
             llm=llm,
             context=context,
             max_retries=4,
             base_delay=2.0,
-            verbose=getattr(args, "verbose", False),
+            verbose=True,
         )
         state_accumulator["finish_data"] = finish_data
         print(f"   ✅ Synthesis complete")

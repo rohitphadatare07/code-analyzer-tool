@@ -49,52 +49,53 @@ from langchain_core.messages import BaseMessage, ToolMessage
 
 _SYNTHESIS_SYSTEM = """You are an expert software architect.
 You have been given a structural analysis of a code repository.
-The analysis includes:
-  - File inventory and directory structure
-  - AST-extracted classes, functions, and call relationships
-  - Community clusters (groups of related code)
-  - God nodes (most-connected core abstractions)
-  - Surprising cross-community connections
-  - Notes from reading key files and searching code patterns
 
 Your job: produce a complete JSON analysis document.
 Respond ONLY with a valid JSON object — no markdown fences, no preamble, no explanation.
 
-Required JSON structure:
+CRITICAL: Output the fields in EXACTLY this order, completing each fully before moving to the next.
+This ensures the most important fields are captured even if the response is long.
+
+Required JSON structure (output fields in this exact order):
 {
-  "summary": "3-5 sentence technical summary of the codebase",
+  "summary": "3-5 sentence technical summary",
   "purpose": "One sentence — what does this repo DO?",
   "architecture_style": "e.g. MVC, microservices, CLI tool, library, monolith",
-  "tech_stack": ["list", "of", "technologies"],
-  "key_components": [
-    {"name": "...", "description": "...", "files": ["..."], "responsibilities": ["..."]}
-  ],
+  "tech_stack": ["Technology1", "Technology2"],
   "data_flow": ["step 1", "step 2", "step 3"],
-  "api_endpoints": [
-    {"method": "GET", "path": "/api/...", "description": "..."}
-  ],
   "database_models": ["ModelName1", "ModelName2"],
-  "security_notes": ["observation 1", "observation 2"],
+  "testing_approach": "brief description",
+  "deployment_info": "brief description",
+  "key_components": [
+    {"name": "...", "description": "one sentence", "files": ["path/to/file"], "responsibilities": ["one item"]}
+  ],
+  "api_endpoints": [
+    {"method": "GET", "path": "/api/...", "description": "brief"}
+  ],
+  "security_notes": ["brief note 1", "brief note 2"],
+  "code_quality_notes": ["brief note 1"],
   "improvement_suggestions": ["suggestion 1", "suggestion 2"],
   "file_details": [
-    {"file": "relative/path.ts", "summary": "what this file does", "confidence": "high"}
+    {"file": "relative/path", "summary": "one sentence", "confidence": "high"}
   ],
   "architecture_notes": [
-    {"title": "short title", "detail": "full observation"}
+    {"title": "short title", "detail": "one sentence"}
   ],
   "dependency_notes": [
-    {"title": "package name", "detail": "why it matters or concerns"}
-  ],
-  "testing_approach": "description of testing strategy",
-  "deployment_info": "how the repo is run / deployed / packaged",
-  "code_quality_notes": ["observation 1", "observation 2"]
+    {"title": "package name", "detail": "one sentence"}
+  ]
 }
 
 Rules:
+- Keep ALL string values concise — one sentence maximum per string field
+- Lists: maximum 8 items per list, 1-2 sentences per item
+- key_components: maximum 6 items
+- file_details: maximum 8 items
 - Use ONLY the information provided. Do not invent file names or APIs.
-- If a field has no data, use an empty list [] or empty string "".
-- The JSON must be parseable by Python json.loads().
-- Do not wrap in markdown code fences.
+- If a field has no data, use [] or "".
+- The JSON must be valid and parseable by Python json.loads().
+- Do NOT wrap in markdown code fences.
+- Do NOT add any text before or after the JSON object.
 """
 
 
@@ -103,20 +104,20 @@ Rules:
 def build_synthesis_context(
     state_accumulator: dict,
     messages: list[BaseMessage],
-    max_nodes: int = 80,
-    max_exploration_chars: int = 8000,
+    max_nodes: int = 50,
+    max_exploration_chars: int = 4000,
 ) -> str:
     """
     Build a compact text payload for the synthesiser from:
       - state_accumulator  : structured core tool outputs
       - messages           : the agent message history (for read_file/search_code notes)
 
-    Returns a single string under ~2000 tokens.
+    Targets ~1500 tokens input so the model has enough budget for ~4096 output tokens.
 
     Parameters
     ----------
     max_nodes : int
-        Max AST nodes to include in the context (keeps token count bounded).
+        Max AST files to include in the context (keeps token count bounded).
     max_exploration_chars : int
         Max characters of compressed exploration notes to include.
     """
@@ -136,8 +137,8 @@ def build_synthesis_context(
         )
         tree = scan.get("directory_tree", "")
         if tree:
-            # Limit tree to 60 lines
-            tree_lines = tree.split("\n")[:60]
+            # Limit tree to 40 lines
+            tree_lines = tree.split("\n")[:40]
             parts.append("DIRECTORY TREE\n" + "\n".join(tree_lines))
 
     # ── 2. AST nodes (capped) ─────────────────────────────────────────────────
@@ -154,7 +155,7 @@ def build_synthesis_context(
 
         node_lines = []
         for src, labels in list(by_file.items())[:max_nodes]:
-            node_lines.append(f"  {src}: {', '.join(labels[:12])}")
+            node_lines.append(f"  {src}: {', '.join(labels[:8])}")
 
         parts.append(
             f"AST NODES ({len(nodes)} total, showing {len(node_lines)} files)\n"
@@ -169,7 +170,7 @@ def build_synthesis_context(
         com_lines = []
         for cid, node_ids in sorted(
             communities.items(), key=lambda x: len(x[1]), reverse=True
-        )[:15]:
+        )[:10]:
             lbl = labels.get(cid, f"Community {cid}")
             coh = cohesion.get(cid, 0.0)
             com_lines.append(f"  [{lbl}] size={len(node_ids)} cohesion={coh:.2f}")
@@ -302,39 +303,76 @@ def synthesise(
         HumanMessage(content=user_message),
     ]
 
+    # Force high enough output token budget so the full JSON is never truncated.
+    # 4096 tokens ≈ ~3000 words of JSON — more than enough for all fields.
+    invoke_kwargs: dict = {"max_tokens": 4096}
+
     delay = base_delay
     last_error: Exception | None = None
+    last_raw: str = ""
 
     for attempt in range(1, max_retries + 1):
         if verbose:
             print(f"   [Synthesiser attempt {attempt}/{max_retries}]")
 
         try:
-            response = llm.invoke(messages)
+            response = llm.invoke(messages, **invoke_kwargs)
             raw = response.content if hasattr(response, "content") else str(response)
+            last_raw = raw
 
-            # Strip any accidental markdown fences
+            # ── Check stop reason before parsing ──────────────────────────────
+            # If the model hit max_tokens, the JSON is truncated — detect early.
+            stop_reason = _get_stop_reason(response)
+            if stop_reason in ("max_tokens", "length", "token_limit"):
+                if verbose:
+                    print(f"   ⚠️  Output truncated (stop_reason={stop_reason}) "
+                          f"on attempt {attempt} — increasing max_tokens and retrying")
+                # Double the token budget and retry immediately
+                invoke_kwargs["max_tokens"] = min(invoke_kwargs["max_tokens"] * 2, 16384)
+                last_error = ValueError(f"Output truncated at max_tokens={invoke_kwargs['max_tokens'] // 2}")
+                if attempt < max_retries:
+                    continue
+                break
+
+            # ── Strip accidental markdown fences ──────────────────────────────
             raw = raw.strip()
             if raw.startswith("```"):
-                raw = raw.split("```")[1]
+                # Handle ```json ... ``` or ``` ... ```
+                inner = raw.split("```", 2)
+                raw = inner[2] if len(inner) > 2 else inner[1]
                 if raw.startswith("json"):
                     raw = raw[4:]
+                # Strip closing fence if present
+                if raw.endswith("```"):
+                    raw = raw[:-3]
             raw = raw.strip()
 
-            finish_data = json.loads(raw)
+            # ── Try full parse ────────────────────────────────────────────────
+            try:
+                finish_data = json.loads(raw)
+                if verbose:
+                    print(f"   ✅ Synthesis complete on attempt {attempt}")
+                return finish_data
+            except json.JSONDecodeError as parse_err:
+                if verbose:
+                    print(f"   ⚠️  JSON parse error on attempt {attempt}: {parse_err}")
+                last_error = parse_err
 
-            if verbose:
-                print(f"   ✅ Synthesis complete on attempt {attempt}")
-
-            return finish_data
-
-        except json.JSONDecodeError as e:
-            last_error = e
-            if verbose:
-                print(f"   ⚠️  JSON parse error on attempt {attempt}: {e}")
-            # JSON parse errors don't need backoff — retry immediately once
-            if attempt == 1:
-                continue
+                # ── Partial recovery: extract completed fields ─────────────────
+                # The JSON was truncated mid-value. Extract whatever completed
+                # successfully rather than returning a blank report.
+                recovered = _recover_partial_json(raw, verbose=verbose)
+                if recovered:
+                    if verbose:
+                        print(f"   ↻  Partial recovery: got {list(recovered.keys())}")
+                    # Still retry — maybe next attempt gives full JSON
+                    if attempt < max_retries:
+                        time.sleep(base_delay)
+                        continue
+                    # Last attempt: use partial rather than empty
+                    full = _empty_finish_data(str(parse_err))
+                    full.update(recovered)
+                    return full
 
         except Exception as e:
             last_error = e
@@ -353,14 +391,157 @@ def synthesise(
                 if verbose:
                     print(f"   ↻  Retrying in {wait:.1f}s...")
                 time.sleep(wait)
-                delay *= 2  # exponential backoff
+                delay *= 2
 
-    # All retries exhausted — return a minimal safe dict so the pipeline
-    # can still produce a partial PDF rather than crashing entirely
+    # All retries exhausted — try one last partial recovery from the last raw response
     if verbose:
         print(f"   ❌ Synthesis failed after {max_retries} attempts: {last_error}")
 
+    if last_raw:
+        recovered = _recover_partial_json(last_raw, verbose=verbose)
+        if recovered:
+            if verbose:
+                print(f"   ↻  Using partial recovery from last response: {list(recovered.keys())}")
+            full = _empty_finish_data(str(last_error))
+            full.update(recovered)
+            return full
+
     return _empty_finish_data(str(last_error))
+
+
+def _get_stop_reason(response) -> str:
+    """
+    Extract the stop reason from a LangChain response object.
+    Different providers put this in different places.
+    """
+    # LangChain AIMessage response_metadata (most providers)
+    meta = getattr(response, "response_metadata", {}) or {}
+
+    # Bedrock Claude
+    if "stopReason" in meta:
+        return meta["stopReason"].lower()
+    # OpenAI / Bedrock Converse
+    if "stop_reason" in meta:
+        return meta["stop_reason"].lower()
+    if "finish_reason" in meta:
+        return meta["finish_reason"].lower()
+    # Some providers nest it under usage_metadata or additional_kwargs
+    extra = getattr(response, "additional_kwargs", {}) or {}
+    if "stop_reason" in extra:
+        return extra["stop_reason"].lower()
+
+    return "stop"  # default — assume normal completion
+
+
+def _recover_partial_json(raw: str, verbose: bool = False) -> dict:
+    """
+    Attempt to salvage a truncated JSON response by extracting
+    all string/list/dict fields that completed successfully.
+
+    Strategy:
+    1. Try progressively shorter substrings (closing the JSON at the last
+       complete field boundary) until json.loads() succeeds.
+    2. If that fails, use regex to extract individual top-level string/list
+       fields that clearly completed.
+
+    Returns a (possibly partial) dict of successfully parsed fields,
+    or {} if nothing can be salvaged.
+    """
+    if not raw:
+        return {}
+
+    # ── Strategy 1: walk back from the end to find a valid JSON boundary ──────
+    # Find the last "complete" comma or closing bracket position and try parsing
+    candidate = raw.strip()
+    for i in range(len(candidate) - 1, max(len(candidate) - 500, 0), -1):
+        ch = candidate[i]
+        if ch not in (",", "}", "]", '"', "\n", " "):
+            continue
+        # Try closing the object at this position
+        stub = candidate[:i].rstrip().rstrip(",")
+        # Count unclosed braces/brackets and close them
+        closed = _close_json(stub)
+        if closed is None:
+            continue
+        try:
+            result = json.loads(closed)
+            if isinstance(result, dict) and result:
+                if verbose:
+                    print(f"   ↻  Recovered valid JSON by closing at char {i}")
+                return result
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    # ── Strategy 2: regex extraction of clearly complete top-level fields ─────
+    import re
+    recovered: dict = {}
+
+    # Extract string fields:  "key": "complete string value"
+    for m in re.finditer(
+        r'"([a-z_]+)"\s*:\s*"((?:[^"\\]|\\.)*)"', raw
+    ):
+        key, val = m.group(1), m.group(2)
+        if key in _FINISH_DATA_KEYS:
+            recovered[key] = val.replace('\\"', '"')
+
+    # Extract simple list fields: "key": ["item1", "item2"]
+    # Only capture lists that are fully closed with ]
+    for m in re.finditer(
+        r'"([a-z_]+)"\s*:\s*(\[[^\]]*\])', raw
+    ):
+        key, val_str = m.group(1), m.group(2)
+        if key in _FINISH_DATA_KEYS:
+            try:
+                recovered[key] = json.loads(val_str)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+    return recovered
+
+
+def _close_json(stub: str) -> str | None:
+    """
+    Given a truncated JSON string, count unclosed braces/brackets
+    and append the correct closing characters.
+    Returns the closed string or None if unbalanced beyond repair.
+    """
+    stack = []
+    in_string = False
+    escape = False
+
+    for ch in stub:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in ("{", "["):
+            stack.append("}" if ch == "{" else "]")
+        elif ch in ("}", "]"):
+            if stack and stack[-1] == ch:
+                stack.pop()
+
+    if len(stack) > 8:
+        # Too many unclosed levels — not worth attempting
+        return None
+
+    return stub + "".join(reversed(stack))
+
+
+# Fields we care about recovering
+_FINISH_DATA_KEYS = {
+    "summary", "purpose", "architecture_style", "tech_stack",
+    "key_components", "data_flow", "api_endpoints", "database_models",
+    "security_notes", "improvement_suggestions", "file_details",
+    "architecture_notes", "dependency_notes", "testing_approach",
+    "deployment_info", "code_quality_notes",
+}
 
 
 def _empty_finish_data(error_note: str = "") -> dict:
