@@ -137,7 +137,6 @@ def build_analysis_json(
         )
     ]
 
-    # Normalise surprising connections
     normalised_surprising = [
         {
             "source": sc.get("source", ""),
@@ -148,11 +147,20 @@ def build_analysis_json(
         for sc in surprising
     ]
 
-    # Normalise suggested questions (may be dicts or strings)
     normalised_questions = [
         q.get("question", str(q)) if isinstance(q, dict) else str(q)
         for q in suggested_qs
     ]
+
+    # ── Pull from AS-IS nested structure (new synthesiser format) ─────────────
+    exec_sum   = fd.get("executive_summary", {})
+    obj        = fd.get("analysis_objective", {})
+    meth       = fd.get("methodology", {})
+    as_is      = fd.get("as_is_state", {})
+    data_api   = fd.get("data_and_api", {})
+    arch       = fd.get("system_architecture", {})
+    sec        = fd.get("security_and_compliance", {})
+    quality    = fd.get("code_quality", {})
 
     # ── Assemble document ──────────────────────────────────────────────────────
     doc: dict[str, Any] = {
@@ -165,45 +173,87 @@ def build_analysis_json(
             "total_files": total_files,
             "total_lines": total_lines,
         },
-        "summary": {
-            "purpose": fd.get("purpose", ""),
-            "architecture_style": fd.get("architecture_style", ""),
-            "overview": fd.get("summary", ""),
-            "testing_approach": fd.get("testing_approach", ""),
-            "deployment_info": fd.get("deployment_info", ""),
+        # ── AS-IS sections ──────────────────────────────────────────────────
+        "executive_summary": {
+            "purpose":            exec_sum.get("purpose", fd.get("purpose", "")),
+            "scope":              exec_sum.get("scope", ""),
+            "methodology":        exec_sum.get("methodology", ""),
+            "critical_findings":  _ensure_list(exec_sum.get("critical_findings")),
+            "strengths":          _ensure_list(exec_sum.get("strengths")),
+            "bottlenecks":        _ensure_list(exec_sum.get("bottlenecks")),
         },
-        "tech_stack": _ensure_list(fd.get("tech_stack")),
-        "key_components": _normalise_components(fd.get("key_components", [])),
-        "data_flow": _ensure_list(fd.get("data_flow")),
-        "api_endpoints": _normalise_endpoints(fd.get("api_endpoints", [])),
-        "database_models": _ensure_list(fd.get("database_models")),
-        "security_notes": _ensure_list(fd.get("security_notes")),
-        "code_quality_notes": _ensure_list(fd.get("code_quality_notes")),
-        "improvement_suggestions": _ensure_list(fd.get("improvement_suggestions")),
-        # New fields from the expanded finish_analysis
-        "file_details": _normalise_file_details(fd.get("file_details", [])),
-        "architecture_notes": _normalise_note_pairs(fd.get("architecture_notes", [])),
+        "analysis_objective": {
+            "defined_goals":      _ensure_list(obj.get("defined_goals")),
+            "scope_boundaries":   obj.get("scope_boundaries", ""),
+            "architecture_style": obj.get("architecture_style",
+                                          fd.get("architecture_style", "")),
+        },
+        "methodology": {
+            "data_collection_methods": _ensure_list(meth.get("data_collection_methods")),
+            "tools_used":              _ensure_list(meth.get("tools_used",
+                                                   fd.get("tech_stack", []))),
+        },
+        "as_is_state": {
+            "process_description": as_is.get("process_description",
+                                             fd.get("summary", "")),
+            "technologies":        _ensure_list(as_is.get("technologies",
+                                               fd.get("tech_stack", []))),
+            "infrastructure":      _ensure_list(as_is.get("infrastructure")),
+        },
+        "data_and_api": {
+            "database_config":     data_api.get("database_config", {}),
+            "tables":              _ensure_list(data_api.get("tables")),
+            "api_endpoints":       _normalise_endpoints(
+                                       data_api.get("api_endpoints",
+                                       fd.get("api_endpoints", []))),
+        },
+        "system_architecture": {
+            "overview":    arch.get("overview", ""),
+            "components":  _normalise_components(
+                               arch.get("components",
+                               fd.get("key_components", []))),
+            "data_flow":   _ensure_list(arch.get("data_flow",
+                                        fd.get("data_flow", []))),
+        },
+        "security_and_compliance": {
+            "auth_mechanism":   sec.get("auth_mechanism", ""),
+            "data_protection":  _ensure_list(sec.get("data_protection",
+                                             fd.get("security_notes", []))),
+            "compliance_gaps":  _ensure_list(sec.get("compliance_gaps")),
+        },
+        "code_quality": {
+            "strengths":              _ensure_list(quality.get("strengths")),
+            "weaknesses":             _ensure_list(quality.get("weaknesses")),
+            "technical_debt":         _ensure_list(quality.get("technical_debt")),
+            "test_coverage":          quality.get("test_coverage",
+                                                  fd.get("testing_approach", "")),
+            "improvement_suggestions": _normalise_improvements(
+                                           quality.get("improvement_suggestions",
+                                           fd.get("improvement_suggestions", []))),
+        },
+        "file_details":     _normalise_file_details(fd.get("file_details", [])),
         "dependency_notes": _normalise_note_pairs(fd.get("dependency_notes", [])),
+        # ── Graph analysis (always from core tools, not LLM) ────────────────
         "graph_analysis": {
-            "total_nodes": total_nodes,
-            "total_edges": total_edges,
+            "total_nodes":      total_nodes,
+            "total_edges":      total_edges,
             "communities_count": len(communities),
-            "communities": communities_list,
+            "communities":      communities_list,
             "god_nodes": [
                 {
                     "label": g.get("label", g.get("id", "")),
-                    "id": g.get("id", ""),
+                    "id":    g.get("id", ""),
                     "edges": int(g.get("edges", 0)),
                 }
                 for g in god_nodes
             ],
             "surprising_connections": normalised_surprising,
-            "suggested_questions": normalised_questions,
+            "suggested_questions":    normalised_questions,
         },
         "repository": {
             "directory_tree": directory_tree or scan.get("directory_tree", ""),
-            "file_counts": scan.get("by_extension", {}),
-            "largest_files": scan.get("largest_files", []),
+            "file_counts":    scan.get("by_extension", {}),
+            "largest_files":  scan.get("largest_files", []),
         },
     }
 
@@ -247,6 +297,21 @@ def _normalise_endpoints(raw: list) -> list[dict]:
         }
         for ep in raw if isinstance(ep, dict)
     ]
+
+
+def _normalise_improvements(raw: list) -> list[dict]:
+    """Normalise improvement_suggestions — handles both dicts and plain strings."""
+    out = []
+    for item in raw:
+        if isinstance(item, dict):
+            out.append({
+                "priority":   item.get("priority", "medium"),
+                "suggestion": item.get("suggestion", ""),
+                "rationale":  item.get("rationale", ""),
+            })
+        elif isinstance(item, str):
+            out.append({"priority": "medium", "suggestion": item, "rationale": ""})
+    return out
 
 
 def _normalise_file_details(raw: list) -> list[dict]:

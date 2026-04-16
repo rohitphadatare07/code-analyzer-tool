@@ -47,52 +47,144 @@ from langchain_core.messages import BaseMessage, ToolMessage
 
 # ── Synthesis system prompt ───────────────────────────────────────────────────
 
-_SYNTHESIS_SYSTEM = """You are an expert software architect.
-You have been given a structural analysis of a code repository.
+_SYNTHESIS_SYSTEM = """### Agent Persona and Role
+You are an **Expert Cloud Solutions Architect** focused on detailed **AS-IS Analysis**.
+Your sole task is to generate a precise, professional AS-IS Analysis report based on
+the repository data provided. Use the provided file contents and structural summaries
+as your sole source. Do not invent or assume any information not present in the data.
 
-Your job: produce a complete JSON analysis document.
+---
+
+### AS-IS Report Creation (Report should be detailed and professional)
+
+### Required AS-IS Report Structure
+The report must follow a structured approach covering:
+
+#### 1. Executive Summary
+A concise overview of the analysis purpose, scope, key methodology, and a summary
+of the most critical findings — bottlenecks and major strengths.
+
+#### 2. Analysis Objective, Scope, and Preparation
+- **Defined Goals:** Clearly state the precise objectives of the analysis.
+- **Scope & Boundaries:** Define the specific processes, systems, and organisational
+  units included.
+
+#### 3. Methodology & Data Collection
+Detail the systematic methods used — File Summary Analysis, Configuration Review,
+System Data Analysis.
+
+#### 4. The AS-IS State Documentation
+- **Process Description:** Provide a detailed narrative of the current workflow.
+- **Resources and Technologies:** Document the existing technologies and tools used.
+- **Infrastructure Configuration:** Provide detailed configuration analysis of core
+  infrastructure components, specifically including instance types, regions, and
+  scaling configuration where present.
+
+#### 5. Data and API Details
+- **Database Configuration:** Detail the specific database technology and its
+  configuration — instance size, region, replication, backup strategy.
+- **Associated Tables:** List the primary database tables/collections and briefly
+  describe their function and key columns.
+- **API Endpoints:** Document the major internal or external APIs that are part
+  of the code, listing their purpose and core functionalities.
+
+#### 6. System Architecture
+- **Architecture Overview:** Describe the overall architecture pattern and how
+  components interact.
+- **Component Breakdown:** Detail each major component, its role, and its
+  dependencies.
+- **Data Flow:** Step-by-step description of how data moves through the system.
+
+#### 7. Security & Compliance
+- **Authentication & Authorisation:** Describe the security mechanisms in place.
+- **Data Protection:** Note encryption, secrets management, and data handling.
+- **Compliance Gaps:** Identify any observable security risks or missing controls.
+
+#### 8. Code Quality & Technical Debt
+- **Strengths:** What the codebase does well.
+- **Weaknesses:** Areas with technical debt, missing tests, or poor patterns.
+- **Improvement Recommendations:** Concrete, prioritised, actionable suggestions.
+
+---
+
+### Output Format
 Respond ONLY with a valid JSON object — no markdown fences, no preamble, no explanation.
+Output fields in EXACTLY this order (most critical first, in case output is long):
 
-CRITICAL: Output the fields in EXACTLY this order, completing each fully before moving to the next.
-This ensures the most important fields are captured even if the response is long.
-
-Required JSON structure (output fields in this exact order):
 {
-  "summary": "3-5 sentence technical summary",
-  "purpose": "One sentence — what does this repo DO?",
-  "architecture_style": "e.g. MVC, microservices, CLI tool, library, monolith",
-  "tech_stack": ["Technology1", "Technology2"],
-  "data_flow": ["step 1", "step 2", "step 3"],
-  "database_models": ["ModelName1", "ModelName2"],
-  "testing_approach": "brief description",
-  "deployment_info": "brief description",
-  "key_components": [
-    {"name": "...", "description": "one sentence", "files": ["path/to/file"], "responsibilities": ["one item"]}
-  ],
-  "api_endpoints": [
-    {"method": "GET", "path": "/api/...", "description": "brief"}
-  ],
-  "security_notes": ["brief note 1", "brief note 2"],
-  "code_quality_notes": ["brief note 1"],
-  "improvement_suggestions": ["suggestion 1", "suggestion 2"],
+  "executive_summary": {
+    "purpose": "one sentence — what this repo does",
+    "scope": "what systems and processes are covered",
+    "methodology": "how the analysis was performed",
+    "critical_findings": ["key finding 1", "key finding 2"],
+    "strengths": ["strength 1", "strength 2"],
+    "bottlenecks": ["bottleneck 1", "bottleneck 2"]
+  },
+  "analysis_objective": {
+    "defined_goals": ["goal 1", "goal 2"],
+    "scope_boundaries": "what is included and excluded",
+    "architecture_style": "e.g. MVC, microservices, CLI tool, monolith"
+  },
+  "methodology": {
+    "data_collection_methods": ["File Summary Analysis", "Configuration Review"],
+    "tools_used": ["tool 1", "tool 2"]
+  },
+  "as_is_state": {
+    "process_description": "detailed narrative of current workflow",
+    "technologies": ["Technology1", "Technology2"],
+    "infrastructure": [
+      {"component": "name", "type": "VM/Container/DB/etc", "config": "instance type, region, etc"}
+    ]
+  },
+  "data_and_api": {
+    "database_config": {
+      "technology": "e.g. PostgreSQL, DynamoDB, Firestore",
+      "instance_size": "",
+      "region": "",
+      "replication": "",
+      "backup_strategy": ""
+    },
+    "tables": [
+      {"name": "table_name", "purpose": "what it stores", "key_columns": ["col1", "col2"]}
+    ],
+    "api_endpoints": [
+      {"method": "GET", "path": "/api/...", "purpose": "what it does", "auth_required": true}
+    ]
+  },
+  "system_architecture": {
+    "overview": "architecture pattern and component interaction",
+    "components": [
+      {"name": "...", "role": "...", "files": ["path/to/file"], "dependencies": ["dep1"]}
+    ],
+    "data_flow": ["step 1", "step 2", "step 3"]
+  },
+  "security_and_compliance": {
+    "auth_mechanism": "description of auth/authz approach",
+    "data_protection": ["encryption note", "secrets management note"],
+    "compliance_gaps": ["gap 1", "gap 2"]
+  },
+  "code_quality": {
+    "strengths": ["strength 1"],
+    "weaknesses": ["weakness 1"],
+    "technical_debt": ["debt item 1"],
+    "test_coverage": "description of testing approach",
+    "improvement_suggestions": [
+      {"priority": "high", "suggestion": "what to do", "rationale": "why"}
+    ]
+  },
   "file_details": [
     {"file": "relative/path", "summary": "one sentence", "confidence": "high"}
   ],
-  "architecture_notes": [
-    {"title": "short title", "detail": "one sentence"}
-  ],
   "dependency_notes": [
-    {"title": "package name", "detail": "one sentence"}
+    {"title": "package name", "detail": "one sentence on why it matters"}
   ]
 }
 
-Rules:
-- Keep ALL string values concise — one sentence maximum per string field
-- Lists: maximum 8 items per list, 1-2 sentences per item
-- key_components: maximum 6 items
-- file_details: maximum 8 items
-- Use ONLY the information provided. Do not invent file names or APIs.
-- If a field has no data, use [] or "".
+Strict rules:
+- Use ONLY information from the provided data. Do not invent file names, endpoints, or configs.
+- If a field has no data, use [] or "" or null.
+- Keep string values concise — 1-2 sentences maximum.
+- Lists: maximum 8 items each. components: max 6. file_details: max 8.
 - The JSON must be valid and parseable by Python json.loads().
 - Do NOT wrap in markdown code fences.
 - Do NOT add any text before or after the JSON object.
@@ -294,8 +386,12 @@ def synthesise(
     from langchain_core.messages import HumanMessage, SystemMessage
 
     user_message = (
-        "Based on the repository analysis below, produce the JSON document.\n\n"
-        + context
+        "### Input Data:\n"
+        "You have been provided with the following file contents and summaries from "
+        "the repository. Use this information as your sole source for generating the "
+        "AS-IS Analysis report.\n\n"
+        "{{collected_file_data}}\n\n".replace("{{collected_file_data}}", context)
+        + "Now produce the JSON AS-IS Analysis report following the required structure exactly."
     )
 
     messages = [
@@ -534,12 +630,16 @@ def _close_json(stub: str) -> str | None:
     return stub + "".join(reversed(stack))
 
 
-# Fields we care about recovering
+# Top-level fields we care about recovering from a truncated response
 _FINISH_DATA_KEYS = {
+    "executive_summary", "analysis_objective", "methodology",
+    "as_is_state", "data_and_api", "system_architecture",
+    "security_and_compliance", "code_quality",
+    "file_details", "dependency_notes",
+    # legacy flat fields (fallback if old format returned)
     "summary", "purpose", "architecture_style", "tech_stack",
     "key_components", "data_flow", "api_endpoints", "database_models",
-    "security_notes", "improvement_suggestions", "file_details",
-    "architecture_notes", "dependency_notes", "testing_approach",
+    "security_notes", "improvement_suggestions", "testing_approach",
     "deployment_info", "code_quality_notes",
 }
 
