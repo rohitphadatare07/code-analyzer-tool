@@ -1,21 +1,24 @@
 """
-LangGraph agentic graph.
+LangGraph exploration graph — pure exploration, no synthesis.
 
 Nodes:
-  agent       — LLM decides what to do next (calls tools or finishes)
-  tool_node   — Executes whatever tools the agent called
-  router      — Decides: loop back to agent, or exit to done
+  agent       — LLM decides which exploration tool to call next
+  tool_node   — Executes the tool call
+  router      — Loop back or exit when exploration is done
 
-The agent is in a ReAct loop:
-  agent → tool_node → agent → tool_node → ... → agent calls finish_analysis → done
+The agent explores freely with 6 tools:
+  scan_repository, extract_ast_graph, cluster_communities,
+  analyze_graph, read_file, search_code
 
-The LLM drives the entire analysis. It:
-  - Decides to run scan_repository first
-  - Decides to call extract_ast_graph and cluster_communities
-  - Decides which files to read_file (based on what looks interesting)
-  - Decides what to search_code for
-  - Decides when it has enough to call finish_analysis
-  - Decides when to call finish_analysis
+It does NOT call finish_analysis — that is handled by synthesiser.synthesise()
+after this loop exits. This means:
+  - Each LLM call during exploration is small (no giant synthesis payload)
+  - Throttling during exploration doesn't cause a stuck synthesis loop
+  - The synthesiser retries independently with exponential backoff
+
+Exit conditions (router):
+  - Agent returns no tool calls (done exploring)
+  - max_iterations safety limit reached
 """
 from __future__ import annotations
 
@@ -23,56 +26,39 @@ import json
 from pathlib import Path
 from typing import Literal
 
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.language_models import BaseChatModel
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 
-from codegrapher.state import AgentState
-from codegrapher.tools import make_tools
+from codegrapher.agent.state import AgentState
+from codegrapher.agent.tools import make_tools
 
 
-SYSTEM_PROMPT = """You are an expert software architect performing a deep analysis of a code repository.
+EXPLORATION_PROMPT = """You are an expert software architect exploring a code repository.
 
-You have tools that let you explore the repository. YOU are the decision-maker — you decide:
-  - Which tools to call, and in what order
-  - Which files to read (based on what you find as you explore)
-  - When to search for specific patterns
-  - When you have seen enough to call finish_analysis
+You have 6 exploration tools. Use them to build a thorough understanding of the codebase.
+You do NOT need to produce a summary or report — just explore as deeply as possible.
+A separate synthesis step will convert your exploration into the final report.
 
-## Your strategy
+## Strategy
 
-1. START with scan_repository to understand the repo's shape and scale
-2. Run extract_ast_graph + cluster_communities to build the structural graph
-3. Run analyze_graph to find god nodes and surprising connections
-4. Read key files with read_file — entry points, main modules, config files
-5. Search for patterns with search_code — API routes, database models, auth, tests
-6. Call finish_analysis ONCE with everything synthesised
+1. scan_repository        — understand file types, sizes, structure
+2. extract_ast_graph      — extract classes, functions, call graph
+3. cluster_communities    — group related code into semantic clusters
+4. analyze_graph          — find god nodes and surprising connections
+5. read_file (×8-15)     — read entry points, main modules, config, tests
+6. search_code (×3-8)    — find API routes, DB models, auth patterns, tests
 
 ## Rules
-- Call scan_repository FIRST, always
-- Call extract_ast_graph before cluster_communities
-- Call cluster_communities before analyze_graph
-- Use read_file and search_code freely — they cost one iteration each and
-  give you context you need to fill finish_analysis accurately
-- Read at least 8-12 files before calling finish_analysis on large repos
-- Call finish_analysis exactly ONCE when you have a complete picture
-- Do NOT call finish_analysis until you have read key files and searched patterns
-- There is no record_finding tool — everything goes into finish_analysis at the end
-
-## finish_analysis fields
-Fill all fields from what you learned during exploration:
-  summary, purpose, architecture_style, tech_stack
-  key_components    — list of {name, description, files, responsibilities}
-  data_flow         — ordered list of steps
-  api_endpoints     — list of {method, path, description}
-  database_models   — list of model/entity names
-  security_notes    — risks, patterns, gaps you observed
-  improvement_suggestions — concrete actionable ideas
-  file_details      — {file, summary, confidence} for every key file you read
-  architecture_notes — {title, detail} for structural/layering observations
-  dependency_notes  — {title, detail} for notable external dependencies
-  testing_approach, deployment_info, code_quality_notes
+- Always start with scan_repository
+- Always run extract_ast_graph → cluster_communities → analyze_graph in order
+- After the graph tools, read key files freely — entry points, main modules,
+  package.json / requirements.txt, config files, README
+- Use search_code to find patterns you can't see from file names alone
+- Stop when you feel you have seen enough to describe the codebase thoroughly
+- Do NOT try to produce a structured report — just explore
+- There is no finish_analysis tool — simply stop calling tools when done
 """
 
 
@@ -80,33 +66,20 @@ def build_graph(
     llm: BaseChatModel,
     repo_root: Path,
     state_accumulator: dict,
-    max_iterations: int = 50,
+    max_iterations: int = 40,
     verbose: bool = False,
 ) -> StateGraph:
-    """
-    Build and compile the LangGraph agentic graph.
-
-    Returns a compiled graph ready to .invoke() or .stream().
-    """
+    """Build and compile the exploration LangGraph."""
     tools = make_tools(repo_root, state_accumulator)
     llm_with_tools = llm.bind_tools(tools)
     tool_node = ToolNode(tools)
 
-    # ── Agent node ─────────────────────────────────────────────────────────────
     def agent_node(state: AgentState) -> dict:
-        """
-        The core agent node. The LLM sees the full message history
-        (including all previous tool results) and decides what to do next.
-        """
         iteration = state.get("iteration", 0)
-
         if verbose:
             print(f"   [Agent step {iteration + 1}] thinking...")
 
-        # Build messages: system + full conversation history
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-
-        # Call LLM — it may return tool_calls or a plain text response
+        messages = [SystemMessage(content=EXPLORATION_PROMPT)] + state["messages"]
         response = llm_with_tools.invoke(messages)
 
         if verbose and hasattr(response, "tool_calls") and response.tool_calls:
@@ -118,42 +91,25 @@ def build_graph(
             "iteration": iteration + 1,
         }
 
-    # ── Router ─────────────────────────────────────────────────────────────────
     def router(state: AgentState) -> Literal["tool_node", "done"]:
-        """
-        Decide whether to execute tool calls or exit.
-
-        Exit conditions:
-          - Agent called finish_analysis (state_accumulator["finished"] = True)
-          - Agent returned no tool calls (finished reasoning)
-          - Max iterations reached (safety limit)
-        """
-        # Check finish signal from tools
-        if state_accumulator.get("finished"):
-            if verbose:
-                print(f"\n   ✅ Agent finished after {state.get('iteration', 0)} steps")
-            return "done"
-
         # Safety limit
         if state.get("iteration", 0) >= max_iterations:
             if verbose:
                 print(f"\n   ⚠️  Max iterations ({max_iterations}) reached")
             return "done"
 
-        # Check last message for tool calls
+        # Agent returned no tool calls — exploration complete
         last_message = state["messages"][-1]
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
             return "tool_node"
 
-        # No tool calls = agent is done
+        if verbose:
+            print(f"\n   ✅ Exploration done after {state.get('iteration', 0)} steps")
         return "done"
 
-    # ── Build graph ────────────────────────────────────────────────────────────
     builder = StateGraph(AgentState)
-
     builder.add_node("agent", agent_node)
     builder.add_node("tool_node", tool_node)
-
     builder.add_edge(START, "agent")
     builder.add_conditional_edges(
         "agent",
@@ -161,30 +117,28 @@ def build_graph(
         {"tool_node": "tool_node", "done": END},
     )
     builder.add_edge("tool_node", "agent")
-
     return builder.compile()
 
 
 def run_agent(
     llm: BaseChatModel,
     repo_root: Path,
-    max_iterations: int = 50,
+    max_iterations: int = 40,
     verbose: bool = False,
 ) -> tuple[dict, dict]:
     """
-    Run the full agentic analysis loop.
+    Run the exploration loop.
 
     Returns
     -------
     state_accumulator : dict
-        All tool outputs: finish_data, graph, communities, god_nodes, scan_result, etc.
+        Structured tool outputs: scan_result, graphify_ast, graph,
+        communities, cohesion, community_labels, god_nodes,
+        surprising_connections, suggested_questions.
     final_state : dict
-        The final LangGraph state (messages, iteration count, etc.)
+        LangGraph final state — includes messages (for synthesiser context).
     """
-    state_accumulator: dict = {
-        "finished": False,
-        "finish_data": {},
-    }
+    state_accumulator: dict = {}
 
     graph = build_graph(
         llm=llm,
@@ -194,17 +148,17 @@ def run_agent(
         verbose=verbose,
     )
 
-    # Initial state
     initial_state: AgentState = {
         "repo_path": str(repo_root),
         "provider_name": "",
         "messages": [
             HumanMessage(content=(
-                f"Please analyze the repository at: {repo_root}\n\n"
+                f"Please explore the repository at: {repo_root}\n\n"
                 "Run: scan_repository → extract_ast_graph → cluster_communities → "
-                "analyze_graph. Then use read_file and search_code to explore key "
-                "files and patterns. Finally call finish_analysis ONCE with everything "
-                "you learned. Be thorough — read at least 8-12 files."
+                "analyze_graph. Then read key files (entry points, main modules, "
+                "config, tests) and search for important patterns. "
+                "Be thorough — read at least 8-12 files. "
+                "Stop when you have a complete picture of the codebase."
             ))
         ],
         "graphify_output": None,

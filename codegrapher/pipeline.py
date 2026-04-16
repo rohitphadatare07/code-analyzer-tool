@@ -1,14 +1,20 @@
 """
 CodeGrapher pipeline orchestrator.
 
-Wires together:
-  1.  LLM provider creation   (codegrapher.agent.providers)
-  2.  LangGraph agentic loop  (codegrapher.agent.graph)
-       └─ tools call into     (codegrapher.core.*) for graph work
-  3.  JSON document builder   (codegrapher.agent.json_agent)
-       └─ converts tool outputs → structured analysis JSON
-  4.  PDF report              (codegrapher.output.pdf_generator)
-       └─ renders JSON → PDF  (no Mermaid, no diagram rendering)
+Stages:
+  1. LLM provider creation         (codegrapher.agent.providers)
+  2. Exploration loop               (codegrapher.agent.graph)
+       └─ 6 tools: scan / AST / cluster / analyze / read_file / search_code
+       └─ Exits naturally when agent stops calling tools
+       └─ No finish_analysis — no throttle loop risk
+  3. Synthesis                      (codegrapher.agent.synthesiser)
+       └─ One dedicated LLM call outside the agent loop
+       └─ Receives compact compressed context (~1000 tokens)
+       └─ Has its own retry + exponential backoff
+       └─ Produces finish_data dict
+  4. JSON document builder          (codegrapher.agent.json_agent)
+       └─ Merges finish_data + graph outputs → structured JSON
+  5. PDF report                     (codegrapher.output.pdf_generator)
 """
 from __future__ import annotations
 
@@ -42,45 +48,74 @@ def run_pipeline(args: Namespace) -> None:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # ── 2. LangGraph agentic loop ─────────────────────────────────────────────
-    print(f"\n🤖 Starting LangGraph agentic analysis...")
+    # ── 2. Exploration loop ───────────────────────────────────────────────────
+    print(f"\n🔍 Starting exploration loop...")
     print(f"   Repository  : {args.repo_path.resolve()}")
-    print(f"   Max steps   : {getattr(args, 'max_iterations', 50)}")
-    print(f"\n   Agent will autonomously:")
-    print(f"   → Run graphify AST extraction + Leiden clustering")
-    print(f"   → Decide which files to read")
-    print(f"   → Record findings as it explores")
-    print(f"   → Generate diagrams from real graph data")
-    print(f"   → Signal completion with executive summary\n")
+    print(f"   Max steps   : {getattr(args, 'max_iterations', 40)}")
+    print(f"\n   Agent will:")
+    print(f"   → Run AST extraction + Leiden clustering")
+    print(f"   → Read key files and search for patterns")
+    print(f"   → Stop when exploration is complete\n")
 
     try:
         from codegrapher.agent.graph import run_agent
         state_accumulator, final_state = run_agent(
             llm=llm,
             repo_root=args.repo_path,
-            max_iterations=getattr(args, "max_iterations", 50),
-            verbose=True,
+            max_iterations=getattr(args, "max_iterations", 40),
+            verbose=getattr(args, "verbose", False),
         )
     except Exception as e:
-        print(f"error during agentic loop: {e}", file=sys.stderr)
+        print(f"error during exploration loop: {e}", file=sys.stderr)
         if getattr(args, "verbose", False):
             import traceback
             traceback.print_exc()
         sys.exit(1)
 
-    findings = state_accumulator.get("finish_data", {})
     iteration = final_state.get("iteration", 0)
+    messages = final_state.get("messages", [])
 
-    print(f"\n   ✅ Agent completed:")
+    print(f"\n   ✅ Exploration completed:")
     print(f"      Steps        : {iteration}")
     print(f"      God nodes    : {len(state_accumulator.get('god_nodes', []))}")
     print(f"      Communities  : {len(state_accumulator.get('communities', {}))}")
+    print(f"      Messages     : {len(messages)}")
 
-    if not state_accumulator.get("finished"):
-        print("      ⚠️  finish_analysis not called — report may be partial")
+    # ── 3. Synthesis — separate LLM call with retry/backoff ───────────────────
+    print("\n🧠 Synthesising analysis (separate call, retry-safe)...")
+    try:
+        from codegrapher.agent.synthesiser import build_synthesis_context, synthesise
 
-    # ── 3. Build structured JSON document from tool outputs ───────────────────
+        context = build_synthesis_context(
+            state_accumulator=state_accumulator,
+            messages=messages,
+        )
+        if getattr(args, "verbose", False):
+            print(f"   Context size : {len(context):,} chars")
+
+        finish_data = synthesise(
+            llm=llm,
+            context=context,
+            max_retries=4,
+            base_delay=2.0,
+            verbose=getattr(args, "verbose", False),
+        )
+        state_accumulator["finish_data"] = finish_data
+        print(f"   ✅ Synthesis complete")
+
+    except Exception as e:
+        print(f"   ⚠️  Synthesis failed: {e} — report will be partial", file=sys.stderr)
+        state_accumulator["finish_data"] = {}
+
+    # ── 4. Collect stats ──────────────────────────────────────────────────────
+    scan = state_accumulator.get("scan_result", {})
+    total_files = scan.get("total_files", 0)
+    tree = scan.get("directory_tree", "")
+    elapsed = time.time() - start
+
+    # ── 5. Build structured JSON document ─────────────────────────────────────
     print("\n📋 Building structured analysis JSON...")
+    analysis_doc = None
     try:
         from codegrapher.agent.json_agent import build_analysis_json, build_analysis_json_string
         analysis_doc = build_analysis_json(
@@ -93,22 +128,13 @@ def run_pipeline(args: Namespace) -> None:
             elapsed_seconds=elapsed,
             directory_tree=tree,
         )
-        # Optionally persist JSON alongside the PDF for debugging / downstream use
         json_path = args.output.with_suffix(".json")
         json_path.write_text(build_analysis_json_string(analysis_doc), encoding="utf-8")
-        print(f"   JSON saved   : {json_path}")
-        state_accumulator["analysis_doc"] = analysis_doc
+        print(f"   JSON saved : {json_path}")
     except Exception as e:
-        print(f"   ⚠️  JSON build failed: {e} — PDF will use raw state_accumulator")
-        analysis_doc = None
+        print(f"   ⚠️  JSON build failed: {e}", file=sys.stderr)
 
-    # ── 4. Collect stats ──────────────────────────────────────────────────────
-    scan = state_accumulator.get("scan_result", {})
-    total_files = scan.get("total_files", 0)
-    tree = scan.get("directory_tree", "")
-    elapsed = time.time() - start
-
-    # ── 5. Generate PDF ───────────────────────────────────────────────────────
+    # ── 6. Generate PDF ───────────────────────────────────────────────────────
     print("\n📄 Generating PDF report...")
     output_path: Path = args.output
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,7 +144,6 @@ def run_pipeline(args: Namespace) -> None:
         if analysis_doc is not None:
             generate_pdf_from_json(output_path=output_path, doc=analysis_doc)
         else:
-            # Fallback: use legacy shim (builds JSON internally)
             generate_pdf(
                 output_path=output_path,
                 repo_name=args.repo_path.resolve().name,

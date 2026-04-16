@@ -1,29 +1,22 @@
 """
 LangGraph tool definitions.
 
-Tools available to the agent (6 total — down from 8):
+Tools available to the agent (6 total — exploration only):
   1. scan_repository     - file counts, sizes, directory tree
   2. extract_ast_graph   - tree-sitter AST extraction
   3. cluster_communities - Leiden/Louvain community detection
   4. analyze_graph       - god nodes, surprising connections
   5. read_file           - read any file in the repo (LLM eyes)
   6. search_code         - grep across the repo (LLM eyes)
-  7. finish_analysis     - ONE call at the end: synthesises everything
-                           the LLM has seen into the full structured report
 
-Removed:
-  - record_finding  : was called once per insight, doubling agent iterations.
-                      All insight fields are now consolidated into finish_analysis,
-                      which the LLM fills in a single call after exploration is done.
-  - generate_diagrams_from_graph : removed in prior refactor (no Mermaid).
+finish_analysis is NOT a tool anymore.
+After the exploration loop ends naturally (agent returns no tool calls),
+the pipeline calls synthesiser.synthesise() as a separate dedicated LLM
+call with a compressed context and its own retry/backoff logic.
 
-Design principle
-----------------
-read_file / search_code return results ONLY to the LLM context window —
-they write nothing to state_accumulator. The LLM accumulates understanding
-across all those calls, then synthesises everything into finish_analysis once.
-This halves the agent iteration count vs the old record_finding pattern,
-giving the agent twice the exploration budget for the same max_iterations.
+This eliminates the throttle loop seen in production: the exploration loop
+is cheap (small per-call context), and the synthesis call is isolated,
+retryable, and receives only a compact payload — not the full 26-step history.
 """
 from __future__ import annotations
 
@@ -63,7 +56,6 @@ _CODE_EXTS = {
 def _safe_resolve(repo_root: Path, rel_path: str) -> Path:
     """Resolve a relative path and guard against path-traversal escapes."""
     p = (repo_root / rel_path).resolve()
-    # is_relative_to is correct; startswith breaks on /foo/bar vs /foo/bar-other
     if not p.is_relative_to(repo_root):
         raise ValueError(f"Path escapes repo root: {rel_path}")
     return p
@@ -101,7 +93,7 @@ def _is_skipped(fname: str) -> bool:
 
 def make_tools(repo_root: Path, state_accumulator: dict) -> list:
     """
-    Build the tool list bound to a specific repo_root.
+    Build the exploration tool list bound to a specific repo_root.
 
     state_accumulator keys written by these tools:
       scan_result    : dict  — from scan_repository
@@ -114,8 +106,9 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
       god_nodes      : list  — from analyze_graph
       surprising_connections: list — from analyze_graph
       suggested_questions   : list — from analyze_graph
-      finish_data    : dict  — from finish_analysis
-      finished       : bool  — from finish_analysis
+
+    Note: finish_analysis is NOT in this list.
+    Synthesis happens outside the agent loop via synthesiser.synthesise().
     """
     root = repo_root.resolve()
 
@@ -133,7 +126,6 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
         """
         ext_counts: dict[str, int] = {}
         total_files = 0
-        # heapq keeps only the 10 largest without sorting the full list
         largest: list[tuple[int, str]] = []
 
         for dirpath, dirnames, filenames in os.walk(root):
@@ -248,7 +240,6 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
             communities = cluster(G)
             cohesion = score_all(G, communities)
 
-            # Label each community by its most common top-level path component
             labels: dict[int, str] = {}
             for cid, node_ids in communities.items():
                 sources = [
@@ -258,7 +249,6 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
                 sources = [s for s in sources if s]
                 if sources:
                     tops = [Path(s).parts[0] if Path(s).parts else s for s in sources]
-                    # mode: most common element
                     labels[cid] = max(set(tops), key=tops.count)
                 else:
                     labels[cid] = f"Community {cid}"
@@ -334,16 +324,17 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
 
     # ── 5. read_file ──────────────────────────────────────────────────────────
     @tool
-    def read_file(path: str, max_lines: int = 300) -> str:
+    def read_file(path: str, max_lines: int = 100) -> str:
         """
-        Read a file inside the repository. Output goes to your context only —
-        use what you learn when filling finish_analysis at the end.
+        Read a file inside the repository. Output goes to your context —
+        the synthesiser will use what you learned here.
 
         Args:
             path: Relative path from the repo root.
-            max_lines: Lines to return (default 300, hard cap 500).
+            max_lines: Lines to return (default 100, hard cap 300).
+                       100 lines is enough to understand what a module does.
         """
-        max_lines = min(max_lines, 500)
+        max_lines = min(max_lines, 300)
         try:
             resolved = _safe_resolve(root, path)
         except ValueError as e:
@@ -363,7 +354,7 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
         total = len(lines)
         if total > max_lines:
             content = "\n".join(lines[:max_lines])
-            content += f"\n\n... [{total - max_lines} more lines — increase max_lines to see more]"
+            content += f"\n\n... [{total - max_lines} more lines truncated]"
 
         return f"=== {path} ({total} lines total) ===\n{content}"
 
@@ -372,16 +363,16 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
     def search_code(
         pattern: str,
         file_glob: str = "*",
-        max_results: int = 30,
+        max_results: int = 20,
     ) -> str:
         """
-        Grep a pattern across all repo files. Output goes to your context only —
-        use what you learn when filling finish_analysis at the end.
+        Grep a pattern across all repo files. Output goes to your context —
+        the synthesiser will use what you learned here.
 
         Args:
             pattern: Text or regex to search for (case-insensitive).
             file_glob: Filename glob filter, e.g. '*.py', '*.ts' (default: all).
-            max_results: Max matching lines to return (default 30).
+            max_results: Max matching lines to return (default 20).
         """
         try:
             regex = re.compile(pattern, re.IGNORECASE)
@@ -423,79 +414,6 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
             return f"No matches found for: {pattern}"
         return f"Found {len(matches)} matches for '{pattern}':\n\n" + "\n".join(matches)
 
-    # ── 7. finish_analysis ────────────────────────────────────────────────────
-    @tool
-    def finish_analysis(
-        summary: str,
-        purpose: str,
-        architecture_style: str,
-        tech_stack: list,
-        key_components: list,
-        data_flow: list,
-        api_endpoints: list,
-        database_models: list,
-        security_notes: list,
-        improvement_suggestions: list,
-        file_details: list,
-        architecture_notes: list,
-        dependency_notes: list,
-        testing_approach: str = "",
-        deployment_info: str = "",
-        code_quality_notes: Optional[list] = None,
-    ) -> str:
-        """
-        Signal analysis complete and provide the full structured report in one call.
-
-        Call this ONCE after you have:
-          - run scan → extract_ast_graph → cluster_communities → analyze_graph
-          - read at least 5-8 key files with read_file
-          - searched for important patterns with search_code
-
-        Everything you learned from read_file and search_code goes here.
-        Do NOT call this until you have a complete picture.
-
-        Args:
-            summary: 3-5 sentence technical summary of the codebase.
-            purpose: One sentence — what does this repo DO?
-            architecture_style: e.g. MVC, microservices, CLI tool, library, monolith.
-            tech_stack: List of technology/framework/language strings.
-            key_components: List of dicts — {name, description, files, responsibilities}.
-            data_flow: Ordered list of strings describing the main data flow.
-            api_endpoints: List of dicts — {method, path, description}.
-            database_models: List of data model / entity name strings.
-            security_notes: List of security observations (risks, patterns, gaps).
-            improvement_suggestions: List of concrete, actionable improvement ideas.
-            file_details: List of dicts — {file, summary, confidence} for key files
-                          you read. One entry per important file you examined.
-            architecture_notes: List of dicts — {title, detail} for architectural
-                                 patterns, layering decisions, or structural observations.
-            dependency_notes: List of dicts — {title, detail} for notable external
-                              dependencies, version concerns, or missing packages.
-            testing_approach: Description of the testing strategy and coverage.
-            deployment_info: How this repo is run / deployed / packaged.
-            code_quality_notes: List of code quality observations.
-        """
-        state_accumulator["finished"] = True
-        state_accumulator["finish_data"] = {
-            "summary": summary,
-            "purpose": purpose,
-            "architecture_style": architecture_style,
-            "tech_stack": tech_stack,
-            "key_components": key_components,
-            "data_flow": data_flow,
-            "api_endpoints": api_endpoints,
-            "database_models": database_models,
-            "security_notes": security_notes,
-            "improvement_suggestions": improvement_suggestions,
-            "file_details": file_details or [],
-            "architecture_notes": architecture_notes or [],
-            "dependency_notes": dependency_notes or [],
-            "testing_approach": testing_approach,
-            "deployment_info": deployment_info,
-            "code_quality_notes": code_quality_notes or [],
-        }
-        return "✓ Analysis complete. Building JSON report..."
-
     return [
         scan_repository,
         extract_ast_graph,
@@ -503,5 +421,4 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
         analyze_graph,
         read_file,
         search_code,
-        finish_analysis,
     ]
