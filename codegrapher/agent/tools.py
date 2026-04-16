@@ -37,18 +37,50 @@ _SKIP_DIRS = {
     ".git", ".svn", "node_modules", "__pycache__", ".pytest_cache",
     ".mypy_cache", "venv", ".venv", "env", "dist", "build",
     ".next", ".nuxt", "coverage", ".tox", ".idea", ".vscode",
+    ".terraform",                    # Terraform provider cache — large, not useful
 }
 
 _SKIP_EXTS = {
     ".pyc", ".pyo", ".class", ".o", ".so", ".dylib",
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp",
     ".zip", ".tar", ".gz", ".whl", ".egg",
+    ".tfstate", ".tfstate.backup",   # Terraform state — may contain secrets
+    ".lock",                         # lock files (package-lock, poetry.lock etc.)
 }
 
+# Application code extensions — used for word-count in scan
 _CODE_EXTS = {
     ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java",
     ".rb", ".cpp", ".c", ".h", ".cs", ".kt", ".swift", ".sh",
 }
+
+# Infrastructure / config extensions — Level 1: counted in scan_repository stats
+_INFRA_EXTS = {
+    ".tf",           # Terraform HCL
+    ".tfvars",       # Terraform variable files
+    ".hcl",          # Generic HCL (Packer, Vault, Consul, Nomad)
+    ".yaml", ".yml", # Kubernetes manifests, Helm, GitHub Actions, docker-compose, Ansible
+    ".toml",         # Rust Cargo, Python pyproject, general config
+    ".json",         # package.json, serverless.json, CDK configs
+    ".dockerfile",   # alternative Dockerfile extension
+    ".env.example",  # environment variable templates (not .env itself)
+    ".ini", ".cfg",  # legacy config files
+    ".conf",         # nginx, haproxy, etc.
+    ".sh", ".bash",  # shell/deploy scripts (already in _CODE_EXTS, listed for clarity)
+}
+
+# Canonical infra filenames regardless of extension
+_INFRA_FILENAMES = {
+    "dockerfile", "docker-compose.yml", "docker-compose.yaml",
+    "docker-compose.override.yml", "docker-compose.override.yaml",
+    "makefile", "jenkinsfile", "procfile",
+    "serverless.yml", "serverless.yaml",
+    "cdk.json", "pulumi.yaml",
+    ".helmignore", "chart.yaml", "values.yaml",
+}
+
+# All extensions that scan_repository should count (code + infra)
+_ALL_COUNTED_EXTS = _CODE_EXTS | _INFRA_EXTS
 
 
 # ── Private helpers ────────────────────────────────────────────────────────────
@@ -86,7 +118,30 @@ def _build_tree(root: Path, max_depth: int = 4) -> str:
 
 
 def _is_skipped(fname: str) -> bool:
-    return any(fname.endswith(e) for e in _SKIP_EXTS)
+    """Return True for binary/generated files that should never be read."""
+    ext = Path(fname).suffix.lower()
+    if ext in _SKIP_EXTS:
+        return True
+    # .tfstate files even without the exact suffix match
+    if fname.endswith(".tfstate") or fname.endswith(".tfstate.backup"):
+        return True
+    return False
+
+
+def _looks_like_k8s(path: Path) -> bool:
+    """Quick heuristic: does this YAML look like a Kubernetes manifest?"""
+    if path.suffix.lower() not in (".yaml", ".yml"):
+        return False
+    try:
+        head = path.read_text(errors="ignore")[:800]
+        return any(kw in head for kw in (
+            "apiVersion:", "kind: Deployment", "kind: Service",
+            "kind: Pod", "kind: ConfigMap", "kind: Ingress",
+            "kind: StatefulSet", "kind: DaemonSet", "kind: Job",
+            "kind: CronJob", "kind: Namespace", "kind: HorizontalPodAutoscaler",
+        ))
+    except Exception:
+        return False
 
 
 # ── Tool factory ───────────────────────────────────────────────────────────────
@@ -116,17 +171,20 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
     @tool
     def scan_repository(include_tree: bool = True) -> str:
         """
-        Scan the repository: count files by extension, find the largest files,
-        build a directory tree. Call this FIRST — it orientates all subsequent
-        decisions about which files to read.
+        Scan the repository: count files by extension (code + infra), find
+        the largest files, build a directory tree, and detect infra presence.
+        Call this FIRST — it orientates all subsequent decisions.
 
         Returns JSON with:
           total_files, by_extension (top 20), largest_files (top 10),
+          infra_files (list of detected infrastructure files),
+          has_terraform, has_kubernetes, has_docker, has_cicd,
           directory_tree (optional).
         """
         ext_counts: dict[str, int] = {}
         total_files = 0
         largest: list[tuple[int, str]] = []
+        infra_files: list[str] = []
 
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [
@@ -137,22 +195,60 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
                 if _is_skipped(fname):
                     continue
                 fp = Path(dirpath) / fname
+                rel = str(fp.relative_to(root))
                 ext = fp.suffix.lower() or "none"
-                size = fp.stat().st_size
+                fname_lower = fname.lower()
+
+                # Count everything that isn't binary noise
                 ext_counts[ext] = ext_counts.get(ext, 0) + 1
                 total_files += 1
+
+                size = fp.stat().st_size
                 if len(largest) < 10:
-                    heapq.heappush(largest, (size, str(fp.relative_to(root))))
+                    heapq.heappush(largest, (size, rel))
                 else:
-                    heapq.heappushpop(largest, (size, str(fp.relative_to(root))))
+                    heapq.heappushpop(largest, (size, rel))
+
+                # Flag infrastructure files
+                if (ext in _INFRA_EXTS or fname_lower in _INFRA_FILENAMES
+                        or fname_lower.startswith("dockerfile")):
+                    infra_files.append(rel)
 
         largest_sorted = sorted(largest, reverse=True)
+
+        # Quick presence flags for the agent and synthesiser
+        has_terraform  = any(".tf" in f or ".tfvars" in f or ".hcl" in f
+                             for f in infra_files)
+        has_kubernetes = any(f for f in infra_files
+                             if _looks_like_k8s(root / f))
+        has_docker     = any("dockerfile" in f.lower() or
+                             "docker-compose" in f.lower()
+                             for f in infra_files)
+        has_cicd       = any(
+                             ".github/workflows" in f or
+                             "jenkinsfile" in f.lower() or
+                             ".gitlab-ci" in f.lower() or
+                             "bitbucket-pipelines" in f.lower() or
+                             "azure-pipelines" in f.lower() or
+                             "circleci" in f.lower()
+                             for f in infra_files)
+        has_helm       = any("chart.yaml" in f.lower() or
+                             "values.yaml" in f.lower() or
+                             "helmfile" in f.lower()
+                             for f in infra_files)
+
         result = {
             "total_files": total_files,
             "by_extension": dict(
                 sorted(ext_counts.items(), key=lambda x: x[1], reverse=True)[:20]
             ),
             "largest_files": [{"size": s, "path": p} for s, p in largest_sorted],
+            "infra_files": sorted(infra_files)[:40],  # cap to avoid huge output
+            "has_terraform":  has_terraform,
+            "has_kubernetes": has_kubernetes,
+            "has_docker":     has_docker,
+            "has_cicd":       has_cicd,
+            "has_helm":       has_helm,
         }
         if include_tree:
             result["directory_tree"] = _build_tree(root)
@@ -197,6 +293,20 @@ def make_tools(repo_root: Path, state_accumulator: dict) -> list:
             result = gf_extract(code_files)
             state_accumulator["graphify_ast"] = result
             state_accumulator["detection"] = detection
+
+            # ── Level 3: infra extraction ─────────────────────────────────
+            infra_files = state_accumulator.get("scan_result", {}).get("infra_files", [])
+            if infra_files:
+                try:
+                    from codegrapher.core.infra_extract import extract_infra
+                    infra_result = extract_infra(root, infra_files)
+                    state_accumulator["infra_result"] = infra_result
+                    infra_summary = infra_result.get("summary", {})
+                    print(f"   Infra: tf={infra_summary.get('tf_file_count',0)} "
+                          f"k8s={infra_summary.get('k8s_manifest_count',0)} "
+                          f"docker={infra_summary.get('docker_file_count',0)}")
+                except Exception as e:
+                    state_accumulator["infra_result"] = {"error": str(e)}
 
             return json.dumps({
                 "nodes_extracted": len(result.get("nodes", [])),

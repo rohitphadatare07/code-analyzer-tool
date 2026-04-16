@@ -133,8 +133,18 @@ Output fields in EXACTLY this order (most critical first, in case output is long
     "process_description": "detailed narrative of current workflow",
     "technologies": ["Technology1", "Technology2"],
     "infrastructure": [
-      {"component": "name", "type": "VM/Container/DB/etc", "config": "instance type, region, etc"}
-    ]
+      {
+        "component": "e.g. EKS Cluster / RDS / API Gateway",
+        "type": "VM/Container/DB/Serverless/Network/Storage",
+        "config": "instance type, region, replicas, ports, image — from Terraform/K8s/Docker data"
+      }
+    ],
+    "terraform_resources": ["aws_eks_cluster.main", "aws_rds_instance.db"],
+    "kubernetes_workloads": ["Deployment/api-server (3 replicas)", "Service/api-lb (LoadBalancer)"],
+    "docker_images": ["node:18-alpine", "postgres:15"],
+    "cicd_pipelines": ["GitHub Actions: build/test/deploy", "stages: lint → test → build → deploy"],
+    "cloud_providers": ["AWS", "GCP"],
+    "deployment_regions": ["us-east-1", "eu-west-1"]
   },
   "data_and_api": {
     "database_config": {
@@ -222,10 +232,21 @@ def build_synthesis_context(
             f"{ext}:{cnt}"
             for ext, cnt in list(scan.get("by_extension", {}).items())[:10]
         )
+        # Include infra presence flags so the LLM knows what was found
+        infra_flags = []
+        for flag in ("has_terraform", "has_kubernetes", "has_docker",
+                     "has_cicd", "has_helm"):
+            if scan.get(flag):
+                infra_flags.append(flag.replace("has_", ""))
+        infra_str = f"  Infra detected: {', '.join(infra_flags)}" if infra_flags else ""
+        infra_file_count = len(scan.get("infra_files", []))
+
         parts.append(
             f"REPOSITORY OVERVIEW\n"
             f"Total files: {scan.get('total_files', 0)}\n"
             f"File types: {ext_summary}\n"
+            f"Infra files: {infra_file_count}"
+            + (f"\n{infra_str}" if infra_str else "")
         )
         tree = scan.get("directory_tree", "")
         if tree:
@@ -301,6 +322,13 @@ def build_synthesis_context(
     if exploration:
         parts.append("EXPLORATION NOTES (from file reads and code searches)\n" + exploration)
 
+    # ── 8. Infrastructure analysis (Level 3 structured extraction) ────────────
+    infra = state_accumulator.get("infra_result")
+    if infra and not infra.get("error"):
+        infra_lines = _format_infra_context(infra)
+        if infra_lines:
+            parts.append("INFRASTRUCTURE ANALYSIS (structured extraction)\n" + infra_lines)
+
     return "\n\n".join(parts)
 
 
@@ -353,6 +381,137 @@ def _compress_exploration(
         total += len(line)
 
     return "\n".join(notes)
+
+
+def _format_infra_context(infra: dict) -> str:
+    """
+    Format the structured infra_result into a compact readable block
+    for the synthesis LLM call.
+    """
+    lines: list[str] = []
+    summary = infra.get("summary", {})
+
+    # High-level summary
+    if summary:
+        cp = summary.get("cloud_providers", [])
+        if cp:
+            lines.append(f"Cloud providers: {', '.join(cp)}")
+        rt = summary.get("resource_types", [])
+        if rt:
+            lines.append(f"Terraform resource types ({len(rt)}): {', '.join(rt[:12])}")
+        k8s = summary.get("k8s_workload_kinds", [])
+        if k8s:
+            lines.append(f"K8s workload kinds: {', '.join(k8s)}")
+        ns = summary.get("k8s_namespaces", [])
+        if ns:
+            lines.append(f"K8s namespaces: {', '.join(ns)}")
+        imgs = summary.get("container_images", [])
+        if imgs:
+            lines.append(f"Container images: {', '.join(imgs[:8])}")
+        cicd = summary.get("cicd_platforms", [])
+        if cicd:
+            lines.append(f"CI/CD platforms: {', '.join(cicd)}")
+
+    # Terraform detail
+    tf_list = infra.get("terraform", [])
+    for tf in tf_list[:3]:
+        lines.append(f"\nTerraform [{tf.get('file','')}]")
+        if tf.get("providers"):
+            lines.append(f"  Providers: {', '.join(tf['providers'])}")
+        if tf.get("backends"):
+            lines.append(f"  Backend: {', '.join(tf['backends'])}")
+        if tf.get("regions"):
+            lines.append(f"  Regions: {', '.join(tf['regions'])}")
+        if tf.get("instance_types"):
+            lines.append(f"  Instance types: {', '.join(tf['instance_types'])}")
+        if tf.get("resource_names"):
+            lines.append(f"  Resources ({tf.get('resource_count',0)}): "
+                         f"{', '.join(tf['resource_names'][:8])}")
+        if tf.get("variables"):
+            lines.append(f"  Variables: {', '.join(tf['variables'][:8])}")
+        if tf.get("outputs"):
+            lines.append(f"  Outputs: {', '.join(tf['outputs'][:6])}")
+
+    # Kubernetes detail
+    k8s_list = infra.get("kubernetes", [])
+    for m in k8s_list[:8]:
+        kind = m.get("kind", "")
+        name = m.get("name", "")
+        ns   = m.get("namespace", "")
+        ns_str = f"/{ns}" if ns else ""
+        line = f"K8s {kind}: {name}{ns_str}"
+        extras = []
+        if m.get("replicas") is not None:
+            extras.append(f"replicas={m['replicas']}")
+        if m.get("images"):
+            extras.append(f"image={m['images'][0]}")
+        if m.get("cpu_limits"):
+            extras.append(f"cpu={m['cpu_limits'][0]}")
+        if m.get("memory_limits"):
+            extras.append(f"mem={m['memory_limits'][0]}")
+        if m.get("service_type"):
+            extras.append(f"type={m['service_type']}")
+        if m.get("hosts"):
+            extras.append(f"host={m['hosts'][0]}")
+        if extras:
+            line += f"  [{', '.join(extras)}]"
+        lines.append(line)
+
+    # Dockerfile detail
+    for d in infra.get("docker", [])[:2]:
+        lines.append(f"\nDockerfile [{d.get('file','')}]")
+        if d.get("base_images"):
+            lines.append(f"  Base images: {', '.join(d['base_images'])}")
+        if d.get("is_multistage"):
+            lines.append(f"  Multi-stage: stages={d.get('stages', [])}")
+        if d.get("exposed_ports"):
+            lines.append(f"  Exposed ports: {', '.join(d['exposed_ports'])}")
+        if d.get("env_vars"):
+            lines.append(f"  Env vars: {', '.join(d['env_vars'][:8])}")
+
+    # docker-compose detail
+    for dc in infra.get("docker_compose", [])[:1]:
+        lines.append(f"\ndocker-compose [{dc.get('file','')}]")
+        for svc in dc.get("services", [])[:6]:
+            svc_info = f"  Service: {svc['name']}"
+            if svc.get("image"):
+                svc_info += f" (image: {svc['image']})"
+            elif svc.get("build"):
+                svc_info += f" (build: {svc['build']})"
+            if svc.get("ports"):
+                svc_info += f" ports: {', '.join(svc['ports'])}"
+            lines.append(svc_info)
+
+    # Helm detail
+    for h in infra.get("helm", [])[:2]:
+        if h.get("type") == "helm_chart":
+            lines.append(f"\nHelm Chart: {h.get('name','')} "
+                         f"v{h.get('version','')} (app: {h.get('app_version','')})")
+        elif h.get("type") == "helm_values":
+            lines.append(f"Helm Values [{h.get('file','')}]: "
+                         f"keys={', '.join(h.get('top_keys',[])[:10])}")
+
+    # CI/CD detail
+    for ci in infra.get("cicd", [])[:3]:
+        lines.append(f"\nCI/CD [{ci.get('platform','')}]: {ci.get('file','')}")
+        if ci.get("jobs"):
+            lines.append(f"  Jobs: {', '.join(ci['jobs'][:8])}")
+        if ci.get("stages"):
+            lines.append(f"  Stages: {', '.join(ci['stages'])}")
+        if ci.get("triggers"):
+            lines.append(f"  Triggers: {', '.join(ci['triggers'][:5])}")
+        if ci.get("environments"):
+            lines.append(f"  Environments: {', '.join(ci['environments'])}")
+
+    # Serverless
+    for sl in infra.get("serverless", [])[:1]:
+        lines.append(f"\nServerless [{sl.get('type','')}]: "
+                     f"provider={sl.get('provider','')} runtime={sl.get('runtime','')} "
+                     f"region={sl.get('region','')}")
+        if sl.get("functions"):
+            lines.append(f"  Functions: {', '.join(sl['functions'][:8])}")
+
+    return "\n".join(lines)
 
 
 # ── Synthesiser ────────────────────────────────────────────────────────────────
