@@ -199,6 +199,13 @@ def build_analysis_json(
             "technologies":        _ensure_list(as_is.get("technologies",
                                                fd.get("tech_stack", []))),
             "infrastructure":      _ensure_list(as_is.get("infrastructure")),
+            # New infra-specific fields populated from Level 3 parsing
+            "terraform_resources": _ensure_list(as_is.get("terraform_resources")),
+            "kubernetes_workloads":_ensure_list(as_is.get("kubernetes_workloads")),
+            "docker_images":       _ensure_list(as_is.get("docker_images")),
+            "cicd_pipelines":      _ensure_list(as_is.get("cicd_pipelines")),
+            "cloud_providers":     _ensure_list(as_is.get("cloud_providers")),
+            "deployment_regions":  _ensure_list(as_is.get("deployment_regions")),
         },
         "data_and_api": {
             "database_config":     data_api.get("database_config", {}),
@@ -254,7 +261,14 @@ def build_analysis_json(
             "directory_tree": directory_tree or scan.get("directory_tree", ""),
             "file_counts":    scan.get("by_extension", {}),
             "largest_files":  scan.get("largest_files", []),
+            "infra_files":    scan.get("infra_files", []),
+            "has_terraform":  scan.get("has_terraform", False),
+            "has_kubernetes": scan.get("has_kubernetes", False),
+            "has_docker":     scan.get("has_docker", False),
+            "has_cicd":       scan.get("has_cicd", False),
+            "has_helm":       scan.get("has_helm", False),
         },
+        "infra_analysis": state_accumulator.get("infra_result", {}),
     }
 
     return doc

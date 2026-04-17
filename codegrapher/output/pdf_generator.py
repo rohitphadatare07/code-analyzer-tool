@@ -14,6 +14,7 @@ Sections
   4.  AS-IS State Documentation
   5.  Data & API Details
   6.  System Architecture
+  6b. Infrastructure Analysis (Terraform, Kubernetes, Docker, CI/CD, Helm)
   7.  Security & Compliance
   8.  Code Quality & Technical Debt
   9.  Graph Analysis (God Nodes & Communities)
@@ -211,6 +212,7 @@ def generate_pdf_from_json(output_path: Path, doc: dict) -> None:
         ("4.",    "AS-IS State Documentation"),
         ("5.",    "Data & API Details"),
         ("6.",    "System Architecture"),
+        ("6b.",   "Infrastructure Analysis"),
         ("7.",    "Security & Compliance"),
         ("8.",    "Code Quality & Technical Debt"),
         ("9.",    "Graph Analysis"),
@@ -433,7 +435,211 @@ def generate_pdf_from_json(output_path: Path, doc: dict) -> None:
             story.append(Paragraph(f"<b>{i}.</b> {step}", s["bullet"]))
     story.append(PageBreak())
 
-    # ── 7. SECURITY & COMPLIANCE ──────────────────────────────────────────────
+    # ── 6b. INFRASTRUCTURE ANALYSIS ───────────────────────────────────────────
+    infra = doc.get("infra_analysis", {})
+    infra_summary = infra.get("summary", {}) if infra else {}
+
+    if infra and not infra.get("error") and infra_summary:
+        sec_hdr("6b.", "Infrastructure Analysis")
+
+        # Overview badges
+        flag_labels = {
+            "has_terraform": "Terraform", "has_kubernetes": "Kubernetes",
+            "has_docker": "Docker", "has_cicd": "CI/CD", "has_helm": "Helm",
+        }
+        repo_info_flags = doc.get("repository", {})
+        badges = [label for key, label in flag_labels.items()
+                  if repo_info_flags.get(key) or infra_summary.get(
+                      f"tf_file_count" if "terraform" in key else
+                      f"k8s_manifest_count" if "kubernetes" in key else ""
+                  )]
+        if badges:
+            story.append(Paragraph(
+                "Detected: " + " · ".join(f"<b>{b}</b>" for b in badges),
+                s["body"]))
+            story.append(Spacer(1, 8))
+
+        # Cloud providers + resource types
+        cp = infra_summary.get("cloud_providers", [])
+        rt = infra_summary.get("resource_types", [])
+        if cp or rt:
+            story.append(_h3("Cloud Resources", s))
+            if cp:
+                story.append(_bullet(f"Cloud providers: {', '.join(cp)}", s))
+            if rt:
+                story.append(_bullet(
+                    f"Resource types ({len(rt)}): {', '.join(rt[:12])}", s))
+
+        # Container images
+        imgs = infra_summary.get("container_images", [])
+        if imgs:
+            story.append(_h3("Container Images", s))
+            for img in imgs[:10]:
+                story.append(_bullet(img, s))
+
+        # Terraform
+        tf_list = infra.get("terraform", [])
+        if tf_list:
+            story.append(_h3("Terraform Configuration", s))
+            for tf in tf_list[:5]:
+                rows = [(k.replace("_", " ").title(), v)
+                        for k, v in [
+                            ("File", tf.get("file", "")),
+                            ("Providers", ", ".join(tf.get("providers", []))),
+                            ("Backend", ", ".join(tf.get("backends", []))),
+                            ("Regions", ", ".join(tf.get("regions", []))),
+                            ("Instance types", ", ".join(tf.get("instance_types", []))),
+                            ("Resources", str(tf.get("resource_count", 0))),
+                            ("Variables", str(len(tf.get("variables", [])))),
+                        ] if v]
+                if rows:
+                    story.append(_kv_table(rows, cw, s))
+                    story.append(Spacer(1, 6))
+            # Resource list table
+            all_resources: list[str] = []
+            for tf in tf_list:
+                all_resources.extend(tf.get("resource_names", []))
+            if all_resources:
+                story.append(Paragraph("Resources declared:", s["h3"]))
+                r_data = [["Resource", "Type"]]
+                for res in all_resources[:20]:
+                    parts_res = res.split(".", 1)
+                    r_data.append([parts_res[1] if len(parts_res) > 1 else res,
+                                   parts_res[0] if len(parts_res) > 1 else ""])
+                r_t = Table(r_data, colWidths=[cw * 0.55, cw * 0.45])
+                r_t.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), ACCENT),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_BG]),
+                    ("GRID", (0, 0), (-1, -1), 0.5, HexColor("#e2e8f0")),
+                    ("PADDING", (0, 0), (-1, -1), 6),
+                ]))
+                story.append(r_t)
+
+        # Kubernetes
+        k8s_list = infra.get("kubernetes", [])
+        if k8s_list:
+            story.append(Spacer(1, 8))
+            story.append(_h3("Kubernetes Manifests", s))
+            k8s_data = [["Kind", "Name", "Namespace", "Image", "Replicas", "CPU/Mem"]]
+            for m in k8s_list[:15]:
+                mani = m.get("manifests", [m])
+                for man in (mani if isinstance(mani, list) else [mani]):
+                    imgs_str = man.get("images", [""])[0] if man.get("images") else ""
+                    cpu_mem = ""
+                    if man.get("cpu_limits") or man.get("memory_limits"):
+                        cpu = man.get("cpu_limits", [""])[0]
+                        mem = man.get("memory_limits", [""])[0]
+                        cpu_mem = f"{cpu}/{mem}".strip("/")
+                    k8s_data.append([
+                        man.get("kind", ""),
+                        man.get("name", ""),
+                        man.get("namespace", ""),
+                        Paragraph(f"<font size='7'>{imgs_str[:40]}</font>",
+                                  s["small"]) if imgs_str else "",
+                        str(man.get("replicas", "")),
+                        cpu_mem,
+                    ])
+            k_t = Table(k8s_data,
+                        colWidths=[cw*0.13, cw*0.17, cw*0.12,
+                                   cw*0.28, cw*0.10, cw*0.20])
+            k_t.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), PRIMARY),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 9),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_BLUE]),
+                ("GRID", (0, 0), (-1, -1), 0.5, HexColor("#e2e8f0")),
+                ("PADDING", (0, 0), (-1, -1), 5),
+                ("FONTSIZE", (0, 1), (-1, -1), 8),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]))
+            story.append(k_t)
+
+        # Docker
+        docker_list = infra.get("docker", [])
+        dc_list = infra.get("docker_compose", [])
+        if docker_list or dc_list:
+            story.append(Spacer(1, 8))
+            story.append(_h3("Docker Configuration", s))
+            for d in docker_list[:3]:
+                story.append(Paragraph(
+                    f"<b>{d.get('file','')}</b>", s["h3"]))
+                rows = [(k, v) for k, v in [
+                    ("Base images", ", ".join(d.get("base_images", []))),
+                    ("Exposed ports", ", ".join(d.get("exposed_ports", []))),
+                    ("Multi-stage", "Yes" if d.get("is_multistage") else "No"),
+                    ("Entrypoint", d.get("entrypoint", "")),
+                    ("Env vars", ", ".join(d.get("env_vars", [])[:8])),
+                ] if v]
+                if rows:
+                    story.append(_kv_table(rows, cw, s))
+                    story.append(Spacer(1, 4))
+            for dc in dc_list[:1]:
+                story.append(Paragraph("docker-compose services:", s["h3"]))
+                for svc in dc.get("services", [])[:8]:
+                    line = f"{svc['name']}"
+                    if svc.get("image"):
+                        line += f" — image: {svc['image']}"
+                    elif svc.get("build"):
+                        line += f" — build: {svc['build']}"
+                    if svc.get("ports"):
+                        line += f" — ports: {', '.join(svc['ports'])}"
+                    story.append(_bullet(line, s))
+
+        # CI/CD
+        cicd_list = infra.get("cicd", [])
+        if cicd_list:
+            story.append(Spacer(1, 8))
+            story.append(_h3("CI/CD Pipelines", s))
+            for ci in cicd_list[:5]:
+                story.append(Paragraph(
+                    f"<b>{ci.get('platform','').replace('_',' ').title()}</b>"
+                    f" — {ci.get('file', '')}",
+                    ParagraphStyle("cip", fontSize=10, fontName="Helvetica-Bold",
+                                   textColor=DARK_TEXT, spaceAfter=3)))
+                if ci.get("jobs"):
+                    story.append(_bullet(f"Jobs: {', '.join(ci['jobs'][:8])}", s))
+                if ci.get("stages"):
+                    story.append(_bullet(f"Stages: {', '.join(ci['stages'])}", s))
+                if ci.get("triggers"):
+                    story.append(_bullet(f"Triggers: {', '.join(ci['triggers'])}", s))
+                if ci.get("environments"):
+                    story.append(_bullet(f"Environments: {', '.join(ci['environments'])}", s))
+                story.append(Spacer(1, 4))
+
+        # Helm
+        helm_list = infra.get("helm", [])
+        if helm_list:
+            story.append(Spacer(1, 8))
+            story.append(_h3("Helm Charts", s))
+            for h in helm_list:
+                if h.get("type") == "helm_chart":
+                    story.append(_bullet(
+                        f"{h.get('name','')} v{h.get('version','')} "
+                        f"(appVersion: {h.get('app_version','')}) — "
+                        f"{h.get('description','')}", s))
+                elif h.get("type") == "helm_values":
+                    story.append(_bullet(
+                        f"values.yaml keys: {', '.join(h.get('top_keys',[])[:10])}", s))
+
+        # Serverless
+        sl_list = infra.get("serverless", [])
+        if sl_list:
+            story.append(Spacer(1, 8))
+            story.append(_h3("Serverless / Function Config", s))
+            for sl in sl_list[:2]:
+                rows = [(k, v) for k, v in [
+                    ("Type", sl.get("type", "")),
+                    ("Provider", sl.get("provider", "")),
+                    ("Runtime", sl.get("runtime", "")),
+                    ("Region", sl.get("region", "")),
+                    ("Functions", ", ".join(sl.get("functions", [])[:8])),
+                    ("AWS resources", ", ".join(sl.get("aws_resources", [])[:6])),
+                ] if v]
+                if rows:
+                    story.append(_kv_table(rows, cw, s))
     sec_hdr("7.", "Security & Compliance")
     if sec.get("auth_mechanism"):
         story.append(_h3("Authentication & Authorisation", s))
