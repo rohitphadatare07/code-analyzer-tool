@@ -1,312 +1,246 @@
-# CodeGrapher
+# codegrapher-mcp
 
-Agentic repository analyzer that generates a comprehensive PDF report with architecture diagrams, data flow, component analysis, and code insights.
+An MCP server that exposes [CodeGrapher's](https://github.com/anthropics) static codebase analysis as tools — tree-sitter AST extraction, NetworkX graph assembly, Leiden community detection, centrality analysis, and deterministic Mermaid diagram generation.
 
-**How it works:** A LangGraph ReAct agent autonomously explores any code repository using graphify's AST extraction and Leiden community detection as tools — deciding which files to read, recording findings, generating diagrams from real graph data, and signalling when it's done.
+**Pure analysis.** No LLM calls. No agent loop. Each tool is deterministic and returns structured JSON.
 
----
+## What this gives you
 
-## Project Structure
+A stateless-looking, tool-based interface to CodeGrapher's analysis pipeline. The original CodeGrapher project ran a LangGraph agent that orchestrated these same primitives via Anthropic/OpenAI/Bedrock LLMs. This server strips all that away and lets the *consumer* (Claude Desktop, Kiro, Cursor, your own LangGraph agent, AWS Transform via `~/.aws/atx/mcp.json`, etc.) decide which tools to call and in what order.
 
-```
-codegrapher/
-├── codegrapher/
-│   ├── __init__.py
-│   ├── __main__.py          ← CLI entry point
-│   ├── pipeline.py          ← orchestrates all steps
-│   │
-│   ├── core/                ← graphify libraries (AST + graph)
-│   │   ├── analyze.py       ← god nodes, surprising connections
-│   │   ├── build.py         ← NetworkX graph assembly
-│   │   ├── cache.py         ← per-file extraction cache
-│   │   ├── cluster.py       ← Leiden/Louvain community detection
-│   │   ├── detect.py        ← file discovery + classification
-│   │   ├── extract.py       ← tree-sitter AST extraction (15+ languages)
-│   │   ├── security.py      ← safe URL fetching, path guards
-│   │   └── validate.py      ← graph schema validation
-│   │
-│   ├── agent/               ← LangGraph ReAct agent
-│   │   ├── providers.py     ← LLM factory (6 providers + custom)
-│   │   ├── state.py         ← LangGraph AgentState TypedDict
-│   │   ├── tools.py         ← 9 tools the agent can call
-│   │   └── graph.py         ← LangGraph agent loop definition
-│   │
-│   └── output/              ← report generation
-│       ├── mermaid_converter.py  ← deterministic graph → Mermaid
-│       ├── diagrams.py           ← offline Mermaid renderer (4-tier)
-│       └── pdf_generator.py      ← ReportLab PDF builder (16 sections)
-│
-├── tests/
-│   └── test_core.py         ← unit + integration tests
-├── .env.example             ← environment variable template
-├── requirements.txt
-└── setup.py
-```
+## Tools
 
----
+| Tool | What it does |
+|---|---|
+| `scan_repository` | File counts by extension, word counts, directory tree |
+| `detect_files` | Classify files into code/docs/config/data/build buckets |
+| `extract_ast_graph` | Tree-sitter AST extraction across 15+ languages |
+| `cluster_communities` | Leiden/Louvain community detection with cohesion scores |
+| `find_god_nodes` | Top-N most-connected nodes (centrality hubs) |
+| `find_surprising_connections` | Cross-community edges that suggest hidden coupling |
+| `suggest_investigation_questions` | Graph-derived prompts worth investigating |
+| `generate_mermaid_diagrams` | Deterministic architecture / flow / component diagrams |
+| `generate_pdf_report` | Render an assessment PDF — graph data always, narrative optional |
+| `load_aws_transform_output` | Parse AWS Transform comprehensive-codebase-analysis output (S3 or local) |
+| `generate_merged_report` | Fuse AWS Transform output with CodeGrapher's graph analysis into one PDF |
+| `read_file` | Path-traversal-safe single-file read |
+| `search_code` | Regex grep across the repo |
+| `get_graph_stats` | Summary stats: nodes, edges, density, kinds, top communities |
+| `reset_cache` | Drop cached analysis for a repo |
 
-## Quick Start
+### Lazy upstream evaluation
 
-### Step 1 — Clone / download the project
+Every tool takes a `repo_path` and is independent. You can call `cluster_communities` without first calling `extract_ast_graph` — the server runs upstream stages on demand and caches the results per repo. Subsequent calls reuse cached extraction, graph, and clusters within the same session.
 
-```bash
-git clone https://github.com/yourname/codegrapher.git
-cd codegrapher
-```
+When the repo changes on disk, call `reset_cache` to force re-analysis.
 
-### Step 2 — Create a virtual environment
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate        # Linux/macOS
-# .venv\Scripts\activate         # Windows
-```
-
-### Step 3 — Install Python dependencies
+## Install
 
 ```bash
 pip install -e .
-
-# For AWS Bedrock support:
-pip install -e ".[bedrock]"
-
-# For Google Gemini support:
-pip install -e ".[gemini]"
-
-# For all providers:
-pip install -e ".[all]"
 ```
 
-### Step 4 — Install Playwright (for offline diagram rendering)
+For better community detection (Leiden vs. fallback Louvain):
 
 ```bash
-playwright install chromium
+pip install -e ".[leiden]"
 ```
 
-This installs a local Chromium browser. After this, diagrams render fully offline — no internet needed at runtime.
-
-### Step 5 — Install Node.js + mermaid-cli (optional, improves diagram quality)
+## Run
 
 ```bash
-# macOS
-brew install node
-npm install -g @mermaid-js/mermaid-cli
-
-# Ubuntu/Debian
-sudo apt install nodejs npm
-npm install -g @mermaid-js/mermaid-cli
-
-# Windows
-winget install OpenJS.NodeJS
-npm install -g @mermaid-js/mermaid-cli
+codegrapher-mcp
 ```
 
-### Step 6 — Set your API key
+Or:
 
 ```bash
-# Copy the template
-cp .env.example .env
-
-# Edit .env and add your key, then:
-export ANTHROPIC_API_KEY=sk-ant-...    # or load from .env
+python -m codegrapher_mcp.server
 ```
 
-### Step 7 — Run
+The server speaks MCP over stdio.
 
-```bash
-codegrapher /path/to/your/repo
+## Wire it up
+
+### Claude Desktop / Kiro / Cursor
+
+`~/.config/claude/claude_desktop_config.json` (or equivalent):
+
+```json
+{
+  "mcpServers": {
+    "codegrapher": {
+      "command": "codegrapher-mcp"
+    }
+  }
+}
 ```
 
-That's it. The PDF report is written to `<repo-name>-codegrapher.pdf` in your current directory.
+### AWS Transform CLI
 
----
+`~/.aws/atx/mcp.json`:
 
-## All Usage Examples
-
-```bash
-# ── Anthropic Claude (default) ────────────────────────────────────────────────
-export ANTHROPIC_API_KEY=sk-ant-...
-codegrapher /path/to/repo
-
-# With custom output path
-codegrapher /path/to/repo --output ./reports/myrepo.pdf
-
-# ── OpenAI ────────────────────────────────────────────────────────────────────
-export OPENAI_API_KEY=sk-...
-codegrapher /path/to/repo --provider openai --model gpt-4o
-
-# ── AWS Bedrock ───────────────────────────────────────────────────────────────
-export AWS_REGION=us-east-1
-# Uses standard boto3 chain: env vars → ~/.aws/credentials → IAM role
-
-# Claude on Bedrock (best quality)
-codegrapher /path/to/repo --provider bedrock \
-  --model anthropic.claude-3-5-sonnet-20241022-v2:0
-
-# Amazon Nova Pro
-codegrapher /path/to/repo --provider bedrock \
-  --model amazon.nova-pro-v1:0
-
-# Meta Llama 3.1 70B
-codegrapher /path/to/repo --provider bedrock \
-  --model meta.llama3-1-70b-instruct-v1:0
-
-# Mistral Large
-codegrapher /path/to/repo --provider bedrock \
-  --model mistral.mistral-large-2402-v1:0
-
-# ── Ollama (fully local, no API key, no internet needed) ──────────────────────
-ollama serve
-ollama pull llama3.2
-codegrapher /path/to/repo --provider ollama --model llama3.2
-
-# Custom Ollama URL
-codegrapher /path/to/repo --provider ollama --model llama3.2 \
-  --api-url http://192.168.1.100:11434
-
-# ── Google Gemini ─────────────────────────────────────────────────────────────
-export GEMINI_API_KEY=AIza...
-codegrapher /path/to/repo --provider gemini --model gemini-2.0-flash
-
-# ── Custom / Self-hosted (any OpenAI-compatible endpoint) ─────────────────────
-codegrapher /path/to/repo \
-  --provider custom \
-  --api-url https://my-llm-server.internal/v1 \
-  --api-key my-secret-key \
-  --model my-model-name
-
-# Works with: vLLM, LM Studio, Together AI, Groq, Azure OpenAI,
-#             Fireworks, Perplexity, or any OpenAI-compatible API.
-
-# ── Tuning ────────────────────────────────────────────────────────────────────
-codegrapher /path/to/repo --max-iterations 30   # faster, less thorough
-codegrapher /path/to/repo --max-iterations 80   # slower, more thorough
-codegrapher /path/to/repo --verbose             # show each agent step
+```json
+{
+  "mcpServers": {
+    "codegrapher": {
+      "command": "codegrapher-mcp"
+    }
+  }
+}
 ```
 
----
+Verify with `atx mcp tools -s codegrapher`.
 
-## Running Tests
+## Example tool use
 
-```bash
-# Run all tests
-pytest tests/ -v
+```jsonc
+// 1. Inventory the repo
+{ "tool": "scan_repository", "args": { "repo_path": "/path/to/repo" } }
 
-# Run only core graph tests (no LLM needed)
-pytest tests/test_core.py -v
+// 2. Build the graph (extraction runs lazily inside)
+{ "tool": "get_graph_stats", "args": { "repo_path": "/path/to/repo" } }
 
-# Run with coverage
-pip install pytest-cov
-pytest tests/ --cov=codegrapher --cov-report=term-missing
+// 3. Find architectural hubs
+{ "tool": "find_god_nodes", "args": { "repo_path": "/path/to/repo", "top_n": 15 } }
+
+// 4. Surface hidden coupling
+{ "tool": "find_surprising_connections", "args": { "repo_path": "/path/to/repo" } }
+
+// 5. Get diagrams
+{ "tool": "generate_mermaid_diagrams", "args": { "repo_path": "/path/to/repo" } }
+
+// 6. Render the PDF — narrative is optional
+{
+  "tool": "generate_pdf_report",
+  "args": {
+    "repo_path": "/path/to/repo",
+    "output_path": "/path/to/report.pdf",
+    "narrative": {
+      "purpose": "What this repo does in one line",
+      "summary": "Three-to-five-sentence executive summary",
+      "architecture_style": "MVC / microservices / library / CLI tool",
+      "tech_stack": ["Python", "FastAPI", "PostgreSQL"],
+      "key_components": [
+        {
+          "name": "auth",
+          "description": "Token-based authentication",
+          "files": ["src/auth/"],
+          "responsibilities": ["Login", "JWT issuance"]
+        }
+      ]
+    }
+  }
+}
 ```
 
----
+## PDF report — what's deterministic vs. caller-supplied
 
-## PDF Report Contents
+`generate_pdf_report` produces a 17-section A4 PDF. The split:
 
-| Section | Description |
-|---------|-------------|
-| 1. Cover page | Repo name, purpose, file/line counts, provider |
-| 2. Table of contents | |
-| 3. Executive summary | Architecture style, testing, deployment |
-| 4. Technology stack | Badge grid + dependency list |
-| 5. Architecture overview | Data flow steps, database models |
-| 6. Architecture diagram | Deterministic Mermaid → PNG (offline) |
-| 7. Data flow diagram | Sequence diagram from actual edges |
-| 8. Component diagram | Community-grouped LR diagram with cohesion % |
-| 9. Key components | Name, description, responsibilities, files |
-| 10. API endpoints | Method + path + description table |
-| 11. Code quality & security | Agent observations |
-| 12. Graph analysis | God nodes + surprising connections (graphify) |
-| 13. File-by-file findings | Agent's per-file analysis |
-| 14. Improvement recommendations | Concrete suggestions |
-| 15. Repository file tree | |
-| 16. Appendix: Agentic trace | Steps, tool calls, communities, elapsed time |
+**Always populated** (deterministic, computed from the graph):
+- §10 God Nodes & Surprising Connections
+- §13 Repository File Tree
+- All embedded Mermaid diagrams (architecture, flow, components)
+- The Analysis Trace appendix (graph metrics, community count, etc.)
 
----
+**Populated from caller's `narrative` dict** (or empty if absent):
+- §1 Executive Summary, §2 Tech Stack, §3 Architecture Overview
+- §7 Key Components, §8 API Endpoints, §9 Code Quality & Security
+- §11 File-by-File Findings, §12 Improvement Recommendations
 
-## Diagram Rendering (Offline-Capable)
+The MCP server itself never invokes an LLM. Whoever calls the tool decides what narrative to provide — handwritten, AWS Transform's output, your own LangGraph agent's findings, or nothing at all.
 
-Diagrams are generated from the **real graphify graph** — not from LLM memory. The rendering chain:
+## AWS Transform integration (Pattern A)
 
-```
-1. Playwright + local mermaid.js    (offline, PNG, best quality)
-   Requires: pip install playwright && playwright install chromium
-             npm install -g @mermaid-js/mermaid-cli
+Two tools fuse AWS Transform output with CodeGrapher's graph analysis.
 
-2. mmdc CLI                         (offline, PNG, if Chrome configured)
+```jsonc
+// 1. Parse AWS Transform output to see what's there
+{
+  "tool": "load_aws_transform_output",
+  "args": {
+    "aws_output_path": "s3://atx-custom-output-1234/transformations/myjob/202604010000abc-def/"
+    // or a local path: "/data/aws-output/"
+  }
+}
+// Returns: { sections_found: {...}, missing_sections: [...], unparsed_files: [...] }
 
-3. mermaid.ink API                  (online fallback)
-
-4. Pure Python SVG renderer         (always works, zero dependencies)
-   Parses Mermaid syntax → clean SVG directly in Python
-```
-
-After `playwright install chromium`, the tool works completely offline.
-
----
-
-## Agent Tools
-
-The LangGraph agent has 9 tools. It decides the order:
-
-| Tool | What it does |
-|------|-------------|
-| `scan_repository` | File counts, sizes, directory tree |
-| `extract_ast_graph` | graphify tree-sitter AST extraction |
-| `cluster_communities` | Leiden/Louvain community detection |
-| `analyze_graph` | God nodes + surprising connections |
-| `read_file` | Agent-chosen file reading |
-| `search_code` | Regex grep across repo |
-| `record_finding` | Save insight to report |
-| `generate_diagrams_from_graph` | Deterministic Mermaid from real graph |
-| `finish_analysis` | Signal done + executive summary |
-
----
-
-## Supported Bedrock Models
-
-| Model ID | Notes |
-|----------|-------|
-| `anthropic.claude-3-5-sonnet-20241022-v2:0` | Best quality |
-| `anthropic.claude-3-haiku-20240307-v1:0` | Fast & cheap |
-| `amazon.nova-pro-v1:0` | Amazon flagship |
-| `amazon.nova-lite-v1:0` | Fast |
-| `meta.llama3-1-70b-instruct-v1:0` | Open source |
-| `meta.llama3-1-8b-instruct-v1:0` | Smallest |
-| `mistral.mistral-large-2402-v1:0` | Strong reasoning |
-
----
-
-## Troubleshooting
-
-**`ModuleNotFoundError: No module named 'langgraph'`**
-```bash
-pip install langgraph langchain-core langchain-anthropic
+// 2. Generate a merged report
+{
+  "tool": "generate_merged_report",
+  "args": {
+    "repo_path": "/path/to/repo",
+    "aws_output_path": "/data/aws-output/",
+    "output_path": "/path/to/merged.pdf",
+    "verify_business_rules": true
+  }
+}
 ```
 
-**`ModuleNotFoundError: No module named 'tree_sitter'`**
-```bash
-pip install tree-sitter tree-sitter-python tree-sitter-javascript
-```
+### What each side contributes
 
-**Diagrams showing as SVG boxes instead of PNG**
-```bash
-playwright install chromium
-npm install -g @mermaid-js/mermaid-cli
-```
+| Section | Source | Why |
+|---|---|---|
+| Executive Summary | **AWS** | LLM-summarized prose is AWS's strength |
+| Tech Stack | **AWS** | Classification task |
+| Architecture Style | **AWS** | LLM does this well |
+| Key Components | **AWS** labels + CodeGrapher membership | AWS describes; graph grounds the file lists |
+| Data Flow | **AWS** | Plain-language is AWS's strength |
+| API Endpoints / DB Models | **AWS** | Behavioral analysis output |
+| Business Rules | **Merged + verified** | AWS extracts; CodeGrapher anchors each rule to actual call paths. Unverifiable rules flagged for review |
+| God Nodes / Surprising Connections | **CodeGrapher** | AWS doesn't compute centrality |
+| Communities & Cohesion | **CodeGrapher** | Leiden output |
+| Mermaid Diagrams | **CodeGrapher** | Deterministic from graph |
+| Improvement Recommendations | **AWS** + CodeGrapher cross-reference | High-debt + high-centrality files surface as priority items |
+| File Tree | **CodeGrapher** | Filesystem walk |
 
-**AWS Bedrock `NoCredentialsError`**
-```bash
-aws configure         # sets up ~/.aws/credentials
-# or
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_REGION=us-east-1
-```
+### Business rule verification
 
-**Ollama `ConnectionRefusedError`**
-```bash
-ollama serve          # start Ollama server
-ollama pull llama3.2  # pull the model first
-```
+When `verify_business_rules: true`, CodeGrapher attempts to anchor each
+AWS-extracted business rule to actual nodes in the code graph. Rules
+referencing functions or files that don't exist in the graph are flagged
+as `unverified` — they may be LLM hallucinations from AWS's behavioral
+analysis layer. This is the most defensible piece of the merge: an
+independent cross-check of AWS's automated-reasoning claims.
+
+### S3 vs. local
+
+The AWS tools accept either:
+- **Local directory** — already-downloaded output. Tool reads it directly.
+- **`s3://bucket/prefix/` URL** — tool downloads via boto3 to a temp directory,
+  then parses. Requires `pip install boto3` and AWS credentials.
+
+### Schema lenience
+
+AWS does not publish a file-level schema for comprehensive-codebase-analysis
+output. The parser scans the directory for known section names
+(executive_summary, technical_debt_report, architecture, code_analysis,
+domains, components, behavior, dependencies, recommendations) and accepts
+JSON or Markdown. Files it doesn't recognize are listed in `unparsed_files`
+so you can see what was skipped. Sections expected but absent are listed
+in `missing_sections`. Adapt `_SECTION_PATTERNS` and the per-section parsers
+in `aws_transform.py` when you have real output to match against.
+
+## What was removed vs. CodeGrapher
+
+| Removed | Why |
+|---|---|
+| `codegrapher/agent/` | Whole LangGraph agent (graph, providers, state, tools) |
+| `codegrapher/__main__.py` | CLI driver for the agent |
+| `codegrapher/pipeline.py` (original) | Agent orchestration glue |
+| `record_finding`, `finish_analysis` tools | LLM-only state mutators |
+| `langchain-*`, `langgraph`, `boto3`, `langchain-aws` | LLM provider deps |
+
+## What was kept
+
+- `codegrapher_mcp/core/` — full graphify analysis library:
+  `detect`, `extract`, `build`, `cluster`, `analyze`, `cache`, `security`, `validate`
+- `codegrapher_mcp/output/mermaid_converter.py` — deterministic diagrams
+- `codegrapher_mcp/output/diagrams.py` — diagram rendering helpers
+- `codegrapher_mcp/output/pdf_generator.py` — PDF rendering (now invoked
+  as a tool with caller-supplied narrative; agent-specific labels relabelled)
+
+## License
+
+MIT

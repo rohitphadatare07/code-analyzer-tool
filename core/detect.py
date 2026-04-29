@@ -17,20 +17,7 @@ class FileType(str, Enum):
 
 _MANIFEST_PATH = "graphify-out/manifest.json"
 
-CODE_EXTENSIONS = {
-    # Application languages
-    '.py', '.ts', '.js', '.jsx', '.tsx', '.go', '.rs', '.java',
-    '.cpp', '.cc', '.cxx', '.c', '.h', '.hpp', '.rb', '.swift',
-    '.kt', '.kts', '.cs', '.scala', '.php', '.lua', '.toc', '.zig',
-    '.ps1', '.ex', '.exs', '.m', '.mm', '.jl',
-    # Infrastructure & deployment (Level 1+2+3)
-    '.tf', '.tfvars', '.hcl',                # Terraform / HCL
-    '.yaml', '.yml',                          # Kubernetes, Helm, CI/CD, Ansible, compose
-    '.toml',                                  # Cargo, pyproject, general config
-    '.dockerfile',                            # alternative Dockerfile naming
-    '.sh', '.bash',                           # shell scripts
-    '.conf', '.ini', '.cfg',                  # nginx, haproxy, legacy config
-}
+CODE_EXTENSIONS = {'.py', '.ts', '.js', '.jsx', '.tsx', '.go', '.rs', '.java', '.cpp', '.cc', '.cxx', '.c', '.h', '.hpp', '.rb', '.swift', '.kt', '.kts', '.cs', '.scala', '.php', '.lua', '.toc', '.zig', '.ps1', '.ex', '.exs', '.m', '.mm', '.jl'}
 DOC_EXTENSIONS = {'.md', '.txt', '.rst'}
 PAPER_EXTENSIONS = {'.pdf'}
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}
