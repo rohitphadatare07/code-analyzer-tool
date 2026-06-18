@@ -1,17 +1,24 @@
 ---
 name: ascii-to-mermaid-diagrams
 description: >
-  Convert ASCII / Unicode art found in atx analysis Markdown into validated
-  Mermaid diagrams rendered to PNG and embedded into the DOCX. ALWAYS use this
-  skill whenever the analysis Markdown under ATXDocumentation/ contains hand-drawn
-  box-and-arrow art, flow diagrams, or any non-Mermaid diagram drawn with
-  characters. Runs a deterministic pipeline (scan → finalize → embed); you only
-  intervene to convert the handful of blocks the parser cannot read. Does NOT
-  touch Section 7.2 — that diagram is owned by the awslabs.aws-diagram-mcp-server
-  MCP path.
+  MANDATORY diagram step of every atx codebase analysis / code assessment that
+  produces a DOCX. Invoke this skill during ANY comprehensive analysis, repo
+  assessment, or atx run — right after atx writes ATXDocumentation/ and before
+  DOCX assembly — to convert ASCII / Unicode art into validated Mermaid PNGs via
+  its deterministic script. Do NOT convert ASCII art to Mermaid yourself: hand
+  conversion is a defect and this script is the only sanctioned path. Also use it
+  any time Markdown contains hand-drawn box-and-arrow art, flow diagrams, or
+  non-Mermaid diagrams drawn with characters. Excludes Section 7.2, which is owned
+  by the awslabs.aws-diagram-mcp-server MCP path.
 ---
 
 # ASCII → Mermaid diagrams
+
+This skill runs as a **step of the atx analysis pipeline**, not only on direct
+request. Whenever you are performing a code assessment / atx run that emits a
+DOCX, the diagram phase MUST route ASCII conversion through this skill's script.
+See `.kiro/steering/diagram-pipeline-binding.md` (always loaded) — it forbids
+hand-conversion in every turn.
 
 The mechanical work is done by `scripts/ascii_diagram_pipeline.py`. Your role is
 a **per-diagram subroutine**, not the orchestrator: run the script, then convert
@@ -21,6 +28,16 @@ hand-classify, or hand-render — that is what caused diagram drops.
 **Scope:** every section except **7.2**. The Section 7.2 target architecture is
 synthesized separately via the AWS Diagram MCP and must not be produced here. The
 pipeline refuses 7.2 as a placement target; never override that.
+
+## When this fires
+
+- Inside `atx-single-repo-analysis` / `atx-multi-repo-analysis` diagram phase
+  (the orchestrator calls the script directly — see "Wiring" below).
+- Whenever you read ASCII/Unicode art out of any `.md` under `ATXDocumentation/`.
+- On explicit request to convert ASCII diagrams.
+
+If you are about to write Mermaid for art you read from a file, STOP and run
+`scan` instead.
 
 ## Pipeline
 
@@ -85,6 +102,14 @@ python .kiro/skills/ascii-to-mermaid-diagrams/scripts/ascii_diagram_pipeline.py 
 Inserts each PNG under its `target_section` heading with a `Figure <n>` caption,
 then asserts `embedded_count == manifest_count`. If that assertion fails the DOCX
 is not coverage-complete — do not proceed to validation.
+
+## Wiring (how the orchestrator invokes this)
+
+`atx-single-repo-analysis` and `atx-multi-repo-analysis` must call the script by
+path in their diagram phase rather than describing the conversion in prose. The
+exact phase edit is in `ACTIVATION-FIX.md`. This removes the cross-skill
+activation dependency entirely: the orchestrator runs the script, so this skill
+never has to "auto-trigger" mid-run.
 
 ## Output contract
 
