@@ -102,6 +102,8 @@ class Block:
     line_range: tuple[int, int]
     raw: str
     fenced: bool
+    heading: str = ""          # nearest Markdown heading above the block
+    heading_path: str = ""     # full "H1 > H2 > H3" trail (for disambiguation)
 
 
 @dataclass
@@ -134,28 +136,55 @@ class ManifestRow:
     node_count: int = 0
     edge_count: int = 0
     confidence: float = 0.0
-    mermaid_status: str = "pending"     # pending|ok|needs_llm
+    mermaid_status: str = "pending"     # pending|needs_conversion|ok|dropped
     render_status: str = "pending"      # pending|ok|failed
     original_md_path: str = ""
     original_line_range: tuple[int, int] = (0, 0)
+    raw_sha256: str = ""                 # provenance: sha of the exact source block
 
 
 # --------------------------------------------------------------------------- #
 # 1. Extraction
 # --------------------------------------------------------------------------- #
 FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})(.*)$")
+HEADING_MD_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+
+
+def _heading_trail(stack: list[tuple[int, str]]) -> str:
+    return " > ".join(text for _level, text in stack)
 
 
 def extract_blocks(md_root: Path) -> list[Block]:
-    """Pull fenced and indented candidate art blocks out of every .md file."""
+    """Pull fenced and indented candidate art blocks out of every .md file.
+
+    Each block records the nearest Markdown heading above it (``heading``) and
+    the full heading trail (``heading_path``). The heading — not any label drawn
+    inside the art — is the source of the figure title (so a diagram under
+    ``## Component Diagram`` is titled "Component Diagram", never "SERVER").
+    """
     blocks: list[Block] = []
     counter = 0
     for md in sorted(md_root.rglob("*.md")):
         lines = md.read_text(encoding="utf-8", errors="replace").splitlines()
         rel = str(md.relative_to(md_root))
+        heading_stack: list[tuple[int, str]] = []  # (level, text), shallow->deep
         i = 0
         n = len(lines)
         while i < n:
+            # track markdown headings (outside fences) to title diagrams by section
+            hm = HEADING_MD_RE.match(lines[i])
+            if hm:
+                level = len(hm.group(1))
+                text = hm.group(2).strip()
+                while heading_stack and heading_stack[-1][0] >= level:
+                    heading_stack.pop()
+                heading_stack.append((level, text))
+                i += 1
+                continue
+
+            nearest = heading_stack[-1][1] if heading_stack else ""
+            trail = _heading_trail(heading_stack)
+
             fence = FENCE_RE.match(lines[i])
             if fence:
                 info = fence.group(3).strip().lower()
@@ -175,6 +204,8 @@ def extract_blocks(md_root: Path) -> list[Block]:
                         line_range=(i + 1, j + 1),
                         raw="\n".join(buf),
                         fenced=True,
+                        heading=nearest,
+                        heading_path=trail,
                     ))
                 i = j + 1
                 continue
@@ -195,6 +226,8 @@ def extract_blocks(md_root: Path) -> list[Block]:
                         line_range=(i + 1, j),
                         raw="\n".join(buf),
                         fenced=False,
+                        heading=nearest,
+                        heading_path=trail,
                     ))
                 i = j
                 continue
@@ -247,10 +280,21 @@ def qualify(block: Block) -> tuple[bool, str]:
 # 3. Classification
 # --------------------------------------------------------------------------- #
 def classify_type(raw: str) -> str:
+    """Suggest a Mermaid diagram type. Used ONLY as a hint for the LLM-fallback
+    residue — the deterministic parsed path is always a flowchart.
+
+    Alphabetic keywords are matched on word boundaries so that, e.g., "actor"
+    does not match inside "extractors.js" and "state" does not match inside
+    "statement".
+    """
     low = raw.lower()
     for mtype, kws in MERMAID_KEYWORDS:
-        if any(kw in low for kw in kws):
-            return mtype
+        for kw in kws:
+            if kw.isalpha():
+                if re.search(r"\b" + re.escape(kw) + r"\b", low):
+                    return mtype
+            elif kw in low:  # symbol keywords like "->>", "[*]", "||--"
+                return mtype
     return "flowchart TD"
 
 
@@ -477,6 +521,44 @@ def _width_for(node_count: int) -> int:
     return 1600
 
 
+MERMAID_CONFIG = {
+    "theme": "base",
+    "themeVariables": {
+        "fontFamily": "Arial, Helvetica, sans-serif",
+        "fontSize": "16px",
+        "primaryColor": "#eef3fb",
+        "primaryBorderColor": "#3b6fb5",
+        "primaryTextColor": "#1b2a41",
+        "lineColor": "#5b6b7f",
+        "tertiaryColor": "#f7f9fc",
+        "clusterBkg": "#f4f7fb",
+        "clusterBorder": "#c3d0e0",
+    },
+    "flowchart": {"curve": "basis", "htmlLabels": True,
+                  "nodeSpacing": 55, "rankSpacing": 65, "padding": 12},
+}
+# Subtle rounded corners + readable cluster (subgraph) titles, applied to all
+# diagrams so the report looks cohesive for the client.
+MERMAID_THEME_CSS = (
+    ".node rect,.node polygon{rx:6px;ry:6px}"
+    ".cluster rect{rx:8px;ry:8px}"
+    ".cluster .cluster-label,.cluster text{font-weight:600;fill:#1b2a41}"
+    ".edgeLabel{background:#ffffff}"
+)
+
+
+def _write_render_assets(out: Path) -> tuple[Path, Path, Path]:
+    cfg = out / "mermaid-config.json"
+    css = out / "mermaid-theme.css"
+    pup = out / "puppeteer.json"
+    cfg.write_text(json.dumps(MERMAID_CONFIG, indent=2), encoding="utf-8")
+    css.write_text(MERMAID_THEME_CSS, encoding="utf-8")
+    # containers/sandboxes typically need --no-sandbox for headless Chromium
+    pup.write_text(json.dumps({"args": ["--no-sandbox", "--disable-setuid-sandbox"]}),
+                   encoding="utf-8")
+    return cfg, css, pup
+
+
 def _ensure_mmdc() -> str | None:
     exe = shutil.which("mmdc")
     if exe:
@@ -490,32 +572,49 @@ def _ensure_mmdc() -> str | None:
     return shutil.which("mmdc")
 
 
-def render_png(mmd_path: Path, png_path: Path, node_count: int,
-               cache_dir: Path) -> bool:
-    """Render .mmd -> .png with a content-hash cache and graceful fallbacks."""
+def render_png(mmd_path: Path, png_path: Path, node_count: int, cache_dir: Path,
+               config_path: Path | None = None, css_path: Path | None = None,
+               puppeteer_path: Path | None = None) -> bool:
+    """Render .mmd -> .png with the shared theme, hi-dpi scale, cache + fallback.
+
+    White background and 2x scale produce a crisp, client-ready figure; the
+    shared config/CSS keep every diagram visually consistent. A puppeteer config
+    (--no-sandbox) is passed for containerized hosts; PUPPETEER_EXECUTABLE_PATH is
+    honored if set.
+    """
     content = mmd_path.read_bytes()
-    key = hashlib.sha256(content + str(_width_for(node_count)).encode()).hexdigest()
+    width = _width_for(node_count)
+    key_src = content + str(width).encode()
+    if config_path and config_path.exists():
+        key_src += config_path.read_bytes()
+    if css_path and css_path.exists():
+        key_src += css_path.read_bytes()
+    key = hashlib.sha256(key_src).hexdigest()
     cached = cache_dir / f"{key}.png"
     if cached.exists():
         shutil.copyfile(cached, png_path)
         return True
 
     mmdc = _ensure_mmdc()
-    width = _width_for(node_count)
     if mmdc:
-        for attempt in range(3):
+        cmd = [mmdc, "-i", str(mmd_path), "-o", str(png_path),
+               "-b", "white", "-w", str(width), "-s", "2"]
+        if config_path and config_path.exists():
+            cmd += ["-c", str(config_path)]
+        if css_path and css_path.exists():
+            cmd += ["-C", str(css_path)]
+        if puppeteer_path and puppeteer_path.exists():
+            cmd += ["-p", str(puppeteer_path)]
+        env = dict(os.environ)
+        for _attempt in range(3):
             try:
-                subprocess.run(
-                    [mmdc, "-i", str(mmd_path), "-o", str(png_path),
-                     "-b", "transparent", "-w", str(width)],
-                    check=True, capture_output=True, timeout=120)
+                subprocess.run(cmd, check=True, capture_output=True, timeout=120, env=env)
                 if png_path.exists() and png_path.stat().st_size > 0:
                     cache_dir.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(png_path, cached)
                     return True
             except Exception:
                 continue
-    # fallback: playwright headless render of mermaid via CDN (best effort)
     if _render_with_playwright(mmd_path, png_path, width):
         cache_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(png_path, cached)
@@ -592,6 +691,8 @@ def self_check(rows: list[ManifestRow]) -> list[str]:
                 problems.append(f"{r.id}: render ok but png missing")
             elif Path(r.png_path).stat().st_size < 5 * 1024:
                 problems.append(f"{r.id}: png < 5KB")
+            if not r.raw_sha256:
+                problems.append(f"{r.id}: embedded without source provenance (raw_sha256)")
         if r.target_section == "7.2":
             problems.append(f"{r.id}: 7.2 is reserved for the MCP path")
     return problems
@@ -601,68 +702,117 @@ def self_check(rows: list[ManifestRow]) -> list[str]:
 # Subcommand: scan
 # --------------------------------------------------------------------------- #
 def cmd_scan(args: argparse.Namespace) -> int:
+    """Enumerate the source ASCII diagrams and LOCK the set.
+
+    Every qualified block becomes one manifest row with a provenance hash of its
+    exact source bytes. The LLM converts each block to Mermaid for visual quality
+    (it reads the whole diagram — all nodes, subgraphs, edges — which the old grid
+    parser could not). The locked manifest is the allowlist: finalize refuses any
+    rendered diagram whose id is not in it, so no fabricated/extra diagram can
+    reach the DOCX. N source blocks -> at most N figures, never more.
+
+    With --auto-parse, a deterministic grid-parsed draft is written for the LLM to
+    refine (off by default; the from-scratch LLM conversion looks better).
+    """
     md_root = Path(args.md_root)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    mmd_dir = out / "mmd"
-    mmd_dir.mkdir(exist_ok=True)
+    (out / "mmd").mkdir(exist_ok=True)
+    (out / "blocks").mkdir(exist_ok=True)
 
     blocks = extract_blocks(md_root)
     rows: list[ManifestRow] = []
-    needs_llm: list[dict[str, Any]] = []
+    queue: list[dict[str, Any]] = []
 
     for b in blocks:
         ok, reason = qualify(b)
         if not ok:
             continue
-        mtype = classify_type(b.raw)
-        g, conf = parse_ascii_to_graph(b.raw)
+        raw_sha = hashlib.sha256(b.raw.encode("utf-8")).hexdigest()
+        (out / "blocks" / f"{b.id}.txt").write_text(b.raw, encoding="utf-8")
         row = ManifestRow(
             id=b.id,
             title=_title_from(b),
-            confidence=conf,
             original_md_path=b.source_md,
             original_line_range=b.line_range,
+            raw_sha256=raw_sha,
+            mermaid_status="needs_conversion",
         )
-        if g is None:
-            row.mermaid_status = "needs_llm"
-            needs_llm.append({
-                "id": b.id,
-                "source_md": b.source_md,
-                "line_range": list(b.line_range),
-                "suggested_type": mtype,
-                "confidence": conf,
-                "raw": b.raw,
-            })
-        else:
-            mmd = graph_to_mermaid(g, mtype)
-            mmd_path = mmd_dir / f"{b.id}.mmd"
-            mmd_path.write_text(mmd, encoding="utf-8")
-            row.mmd_path = str(mmd_path)
-            row.node_count = len(g.nodes)
-            row.edge_count = len(g.edges)
-            row.mermaid_status = "ok"
+        if args.auto_parse:
+            g, conf = parse_ascii_to_graph(b.raw)
+            if g is not None:
+                (out / "mmd" / f"{b.id}.mmd").write_text(
+                    graph_to_mermaid(g, "flowchart TD"), encoding="utf-8")
+                row.confidence = conf  # a draft the LLM should review/improve
+        queue.append({
+            "id": b.id,
+            "title": row.title,
+            "heading_path": b.heading_path,
+            "original_md_path": b.source_md,
+            "line_range": list(b.line_range),
+            "suggested_type": classify_type(b.raw),
+            "raw_sha256": raw_sha,
+            "raw": b.raw,
+        })
         rows.append(row)
 
-    (out / "_needs_llm.json").write_text(json.dumps(needs_llm, indent=2), encoding="utf-8")
+    (out / "_convert_queue.json").write_text(json.dumps(queue, indent=2), encoding="utf-8")
+    (out / "_scan_meta.json").write_text(
+        json.dumps({"md_root": str(md_root), "locked_ids": [r.id for r in rows]}, indent=2),
+        encoding="utf-8")
     _write_manifest(out / "_manifest.partial.json", rows)
     print(json.dumps({
         "blocks_found": len(blocks),
-        "qualified": len(rows),
-        "parsed_to_mmd": sum(1 for r in rows if r.mermaid_status == "ok"),
-        "needs_llm": len(needs_llm),
+        "qualified_locked": len(rows),
+        "to_convert": str(out / "_convert_queue.json"),
+        "note": "LLM: convert every queue entry to mmd/<id>.mmd, faithfully + "
+                "attractively, one at a time. Do NOT add diagrams not in the queue.",
         "manifest": str(out / "_manifest.partial.json"),
     }, indent=2))
     return 0
 
 
+_GENERIC_HEADINGS = {
+    "diagram", "diagrams", "structural diagrams", "structural", "architecture",
+    "overview", "components", "component", "figure",
+}
+
+
 def _title_from(b: Block) -> str:
-    # heuristic title: first non-empty label-ish line or the source filename
+    """Title a diagram by its surrounding Markdown heading — never by a label
+    drawn inside the art.
+
+    Order of preference:
+      1. nearest Markdown heading (e.g. "## Component Diagram" -> "Component Diagram")
+      2. if that heading is too generic ("Diagrams"), the deepest non-generic
+         step of the heading trail, else the humanized filename stem
+      3. as a last resort only, the first text label inside the art
+    """
+    nearest = sanitize_label(b.heading or "")
+    if nearest and nearest.lower() not in _GENERIC_HEADINGS:
+        return nearest[:80]
+
+    # heading missing or generic: try the deepest meaningful trail step
+    if b.heading_path:
+        for step in reversed(b.heading_path.split(" > ")):
+            s = sanitize_label(step)
+            if s and s.lower() not in _GENERIC_HEADINGS:
+                return s[:80]
+
+    stem = Path(b.source_md).stem.replace("-", " ").replace("_", " ").strip()
+    if stem and stem.lower() not in _GENERIC_HEADINGS:
+        return stem.title()[:80]
+
+    # keep a generic heading rather than a misleading box label, if we have one
+    if nearest:
+        return nearest[:80]
+
+    # last resort: first text label inside the art
     for ln in b.raw.splitlines():
         s = sanitize_label(ln)
         if len(s) >= 4 and re.search(r"[A-Za-z]", s):
             return s[:80]
-    return Path(b.source_md).stem.replace("-", " ").title()
+    return (stem.title() or "Diagram")[:80]
 
 
 # --------------------------------------------------------------------------- #
@@ -671,22 +821,49 @@ def _title_from(b: Block) -> str:
 def cmd_finalize(args: argparse.Namespace) -> int:
     out = Path(args.out)
     rows = _read_manifest(out / "_manifest.partial.json")
-    # absorb any LLM-converted blocks dropped back in as <id>.mmd
-    _absorb_llm_converted(out, rows)
+    locked_ids = {r.id for r in rows}
+
+    # LOCK: any mmd/<id>.mmd whose id is not in the locked manifest is a rogue,
+    # fabricated diagram with no source block — refuse it outright.
+    rogue = sorted(p.stem for p in (out / "mmd").glob("*.mmd")
+                   if p.stem not in locked_ids)
+    if rogue:
+        print(json.dumps({
+            "error": "FABRICATED_DIAGRAMS",
+            "detail": "these .mmd files have no source block in the manifest "
+                      "and will not be rendered or embedded",
+            "rogue_ids": rogue,
+        }, indent=2))
+        return 2
+
+    # absorb each LLM-written conversion into its locked row
+    by_id = {r.id: r for r in rows}
+    for mmd in (out / "mmd").glob("*.mmd"):
+        row = by_id.get(mmd.stem)
+        if row is None:
+            continue
+        text = mmd.read_text(encoding="utf-8")
+        row.mmd_path = str(mmd)
+        row.mermaid_status = "ok"
+        row.node_count = text.count("[") + text.count("((") + text.count("{")
+        row.edge_count = text.count("-->") + text.count("---") + text.count("-.->")
 
     placement = {}
     if args.placement and Path(args.placement).exists():
         placement = json.loads(Path(args.placement).read_text(encoding="utf-8"))
 
-    png_dir = out / "png"
-    png_dir.mkdir(exist_ok=True)
+    png_dir = out / "png"; png_dir.mkdir(exist_ok=True)
     cache_dir = out / ".render-cache"
+    cfg, css, pup = _write_render_assets(out)
 
+    unconverted: list[str] = []
     for r in rows:
         if r.mermaid_status != "ok" or not r.mmd_path:
+            r.mermaid_status = "dropped" if r.mermaid_status != "ok" else r.mermaid_status
+            unconverted.append(r.id)
             continue
         png_path = png_dir / f"{r.id}.png"
-        ok = render_png(Path(r.mmd_path), png_path, r.node_count, cache_dir)
+        ok = render_png(Path(r.mmd_path), png_path, r.node_count, cache_dir, cfg, css, pup)
         r.render_status = "ok" if ok else "failed"
         r.png_path = str(png_path) if ok else None
         resolve_target_section(r, placement)
@@ -694,28 +871,14 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     problems = self_check(rows)
     _write_manifest(out / "ascii-mermaid-manifest.json", rows)
     print(json.dumps({
+        "locked_blocks": len(rows),
         "rendered": sum(1 for r in rows if r.render_status == "ok"),
         "failed": sum(1 for r in rows if r.render_status == "failed"),
+        "unconverted": unconverted,  # queue entries the LLM has not yet converted
         "self_check_problems": problems,
         "manifest": str(out / "ascii-mermaid-manifest.json"),
     }, indent=2))
-    return 0 if not problems else 1
-
-
-def _absorb_llm_converted(out: Path, rows: list[ManifestRow]) -> None:
-    """Pick up <id>.mmd files the LLM wrote for _needs_llm.json blocks."""
-    mmd_dir = out / "mmd"
-    by_id = {r.id: r for r in rows}
-    for mmd in mmd_dir.glob("*.mmd"):
-        rid = mmd.stem
-        row = by_id.get(rid)
-        if row and row.mermaid_status == "needs_llm":
-            text = mmd.read_text(encoding="utf-8")
-            row.mmd_path = str(mmd)
-            row.mermaid_status = "ok"
-            row.node_count = text.count("[")  # rough node count from labels
-            row.edge_count = text.count("-->")
-            row.confidence = max(row.confidence, 0.5)
+    return 0 if not problems and not unconverted else 1
 
 
 # --------------------------------------------------------------------------- #
@@ -823,9 +986,12 @@ def build_parser() -> argparse.ArgumentParser:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("scan", help="extract + qualify + parse ASCII art to .mmd")
+    s = sub.add_parser("scan", help="enumerate + lock source ASCII art; emit LLM convert queue")
     s.add_argument("md_root", help="root of ATXDocumentation/ (.md files)")
     s.add_argument("--out", required=True, help="pipeline working dir")
+    s.add_argument("--auto-parse", action="store_true",
+                   help="also write a deterministic grid-parsed draft .mmd for the "
+                        "LLM to refine (default off; from-scratch LLM output looks better)")
     s.set_defaults(func=cmd_scan)
 
     f = sub.add_parser("finalize", help="render .mmd -> png, resolve placement")

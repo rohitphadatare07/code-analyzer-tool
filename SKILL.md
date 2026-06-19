@@ -51,18 +51,35 @@ python .kiro/skills/ascii-to-mermaid-diagrams/scripts/ascii_diagram_pipeline.py 
 ```
 
 Extracts fenced/indented candidate blocks, rejects non-diagrams (markdown
-tables, tree listings, logs, source code), grid-parses confidently-readable art
-into `<work>/mmd/<id>.mmd`, and lists everything it could not parse in
-`<work>/_needs_llm.json`. Writes `<work>/_manifest.partial.json`.
+tables, tree listings, logs, source code), and **locks** the set: one row per
+qualified block in `<work>/_manifest.partial.json`, each with a provenance hash
+of its exact source bytes. Lists every block to convert in
+`<work>/_convert_queue.json` and saves each raw block to `<work>/blocks/<id>.txt`.
+It writes **no** `.mmd` (the LLM does that next) unless `--auto-parse` is passed.
 
-### 2. (you) convert the residue
+The locked manifest is the **allowlist**: in step 3, any diagram whose id is not
+in it is rejected as fabricated. N source blocks → at most N figures, never more.
 
-For each entry in `<work>/_needs_llm.json`, read its `raw` block and
-`suggested_type`, write correct Mermaid, and save it as
-`<work>/mmd/<id>.mmd` (same `id`). Convert **one block at a time**; do not batch.
-Keep node labels faithful to the art; do not invent edges. Leave alone any block
-you genuinely cannot interpret — a dropped uncertain block is better than a
-fabricated diagram. If `_needs_llm.json` is empty, skip this step.
+### 2. (you) convert EVERY queue entry — faithfully and attractively
+
+For each entry in `<work>/_convert_queue.json`, read its `raw` block and write
+**client-quality** Mermaid to `<work>/mmd/<id>.mmd` (same `id`). Convert **one
+block at a time**; do not batch.
+
+Quality + fidelity rules:
+- **Include every node, edge, and grouping** in the source art — do not drop or
+  invent any. Keep labels verbatim from the ASCII (e.g. `validators.js (JSON +
+  verify)`).
+- **Use `subgraph` for visual boxes/containers** (e.g. a `SERVER` or `CLIENT`
+  frame becomes a subgraph) so the rendered diagram mirrors the source grouping.
+- Choose `flowchart LR` or `flowchart TD` to match the source orientation.
+- Do **not** create a `.mmd` for any id that is not in the queue, and do not add
+  decorative diagrams. If a block is genuinely uninterpretable, leave it
+  unconverted (it will be reported as `unconverted`, never fabricated).
+
+The shared theme (`mermaid-config.json` + `mermaid-theme.css`, written by
+finalize) styles every diagram consistently — you do not need to add colors or
+CSS in the `.mmd`; just produce correct structure with subgraphs and labels.
 
 ### 3. finalize
 
