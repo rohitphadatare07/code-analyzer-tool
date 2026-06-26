@@ -179,26 +179,28 @@ everything downstream.
 ### P-2 — Build the API-contract registry (APPROVAL GATE)
 For every in-scope service, capture its **inbound network API** in language-neutral
 form (endpoints/methods, request/response shapes, status/error codes, event schemas)
-in the **control workspace** (not inside any one service repo):
-`./_modernization-control/contract-registry.md` (API-Contract template). Each service
+in the **workspace-root `.kiro/specs/`** (not inside any one service repo):
+`.kiro/specs/modernization-contracts/contract-registry.md` (API-Contract template). Each service
 is both a **provider** (its inbound API is frozen so callers keep working) and a
 **consumer** (it may rely only on the frozen contracts of services it calls).
 → Present the registry. Wait for approval before generating service specs.
 
-> The control workspace holds **all** modernization artifacts for the portfolio —
-> the registry, the portfolio plan, every service spec, and the integration spec.
-> Default location is `./_modernization-control/.kiro/` at the portfolio root; if
-> `modernization.md` specifies a different location or owner, use that.
+> **Layout.** Open ONE Kiro workspace whose root contains the service repos as
+> sibling subfolders. ALL generated specs go in that workspace root's `.kiro/specs/`
+> — never inside the individual repos. This is required: Kiro's supervised
+> spec-execution only recognizes specs under the workspace-root `.kiro/specs/`. Each
+> repo keeps only its own `ATXDocumentation/`. If `modernization.md` specifies a
+> different control location or owner, use that.
 
 ### P-3 — Order the services leaf-first
 Topologically sort the service graph leaf-first; merge cyclic service pairs into one
-combined spec. Write `_modernization-control/_portfolio-plan.md` (Portfolio-Manifest
+combined spec. Write `.kiro/specs/_portfolio-plan.md` (Portfolio-Manifest
 template). Leaf-first here protects **contract stability** (a service's API is pinned
 before its callers are rebuilt against it).
 
 ### P-4 — Generate one spec per service (centralized)
 For each service in portfolio order, create
-`_modernization-control/.kiro/specs/modernize-<service-slug>/` with `requirements.md`,
+`.kiro/specs/modernize-<service-slug>/` with `requirements.md`,
 `design.md`, `tasks.md` from the Unit templates, grounded in that service's analysis,
 its registry entry (the inbound contract it must preserve), and the contracts of the
 services it calls. **Every spec is centralized — none are written into the service
@@ -221,9 +223,9 @@ decide whether it is large/complex enough to warrant exploding into module specs
 - **At/above threshold** → additionally run the **Track M routine one level down**,
   still writing centrally: build the module inventory from that service's md, pin
   **function-signature** contracts for its internal modules in
-  `_modernization-control/.kiro/specs/<service-slug>-contracts/contracts.md`, order
+  `.kiro/specs/<service-slug>-contracts/contracts.md`, order
   modules leaf-first, and emit
-  `_modernization-control/.kiro/specs/modernize-<service-slug>-<module-slug>/` specs
+  `.kiro/specs/modernize-<service-slug>-<module-slug>/` specs
   (each also carrying the same `Target repo:` header). The service's own network
   contract stays the outer boundary; the module specs decompose its internals.
 
@@ -234,7 +236,7 @@ may be split later.
 
 ### P-5 — Final integration spec (only if >1 service converted)
 If the scope converted **more than one** service, create
-`_modernization-control/.kiro/specs/modernize-_integration/` covering cross-service
+`.kiro/specs/modernize-_integration/` covering cross-service
 wiring, deployment/build, end-to-end and contract-conformance tests across the
 portfolio. Depends on every service spec; always last.
 If the scope converted **exactly one** service, **skip this** — the single service
@@ -255,24 +257,22 @@ Placeholders use `{{...}}`. Fill every one; delete bracketed guidance notes. Lan
 placeholders are filled from the **detected source** and **user-stated target** — no
 language is hard-coded.
 
-### Portfolio manifest — `_modernization-control/_portfolio-plan.md`
+### Portfolio manifest — `.kiro/specs/_portfolio-plan.md`
 ```markdown
 # Portfolio Modernization Plan → {{TARGET_LANG}}
 
 Scope: {{all | source-language=<X> | service=<name>}}
 Conversion model: full rewrite, big-bang, integrated and end-to-end tested at the end.
 Ordering: leaf-first across services. Execute top to bottom. Supervised.
-Control workspace: {{_modernization-control/}}
-
-Control workspace: _modernization-control/.kiro/ (holds ALL specs + registry + plan)
+Workspace root: {{path}}/ (holds the service repos + .kiro/specs with ALL specs, registry, plan)
 
 ## Service order
 | # | Service | Detected source | Target repo | Spec location (centralized) | Depends on | Exploded? | Status |
 |---|---------|-----------------|-------------|------------------------------|-----------|-----------|--------|
-| 1 | {{svc}} | {{SOURCE_LANG}} | {{repo path}} | _modernization-control/.kiro/specs/modernize-{{slug}} | (none — leaf) | no | ☐ |
-| 2 | {{svc}} | {{SOURCE_LANG}} | {{repo path}} | _modernization-control/.kiro/specs/modernize-{{slug}} | {{deps}} | yes (N modules) | ☐ |
+| 1 | {{svc}} | {{SOURCE_LANG}} | {{repo path}} | .kiro/specs/modernize-{{slug}} | (none — leaf) | no | ☐ |
+| 2 | {{svc}} | {{SOURCE_LANG}} | {{repo path}} | .kiro/specs/modernize-{{slug}} | {{deps}} | yes (N modules) | ☐ |
 | … | … | … | … | … | … | … | … |
-| N | Integration | — | — | _modernization-control/.kiro/specs/modernize-_integration | all services | — | ☐ |
+| N | Integration | — | — | .kiro/specs/modernize-_integration | all services | — | ☐ |
 
 Status: ☐ not started · ◐ in progress · ☑ done
 (Integration row present only when >1 service is converted.)
@@ -306,7 +306,7 @@ Ordering: leaf-first. Execute top to bottom. Supervised.
 {{executor notes.}}
 ```
 
-### API-contract registry (polyrepo) — `_modernization-control/contract-registry.md`
+### API-contract registry (polyrepo) — `.kiro/specs/modernization-contracts/contract-registry.md`
 ```markdown
 # Service API Contract Registry (language-neutral)
 
