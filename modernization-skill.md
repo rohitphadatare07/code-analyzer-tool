@@ -31,7 +31,10 @@ language. It handles two topologies and **routes between them automatically**:
 - **Polyrepo / microservices** — many repositories; the unit of conversion is a
   **service (repo)**; the frozen boundary between units is a **network API contract**
   (OpenAPI / protobuf / AsyncAPI). A large service is additionally exploded into
-  module specs *inside* its own repo using the monorepo routine.
+  module specs using the monorepo routine.
+
+All polyrepo specs are written to a **single centralized control workspace**, not
+scattered across the service repos. Each spec names the target repo it applies to.
 
 **This skill plans only. It does NOT translate code.** Its output is spec files.
 The end user executes those specs afterward.
@@ -182,9 +185,10 @@ is both a **provider** (its inbound API is frozen so callers keep working) and a
 **consumer** (it may rely only on the frozen contracts of services it calls).
 → Present the registry. Wait for approval before generating service specs.
 
-> Where the control workspace and registry ultimately live, and who owns them, is an
-> open ownership decision. Default location is `./_modernization-control/` at the
-> portfolio root; if `modernization.md` specifies otherwise, use that.
+> The control workspace holds **all** modernization artifacts for the portfolio —
+> the registry, the portfolio plan, every service spec, and the integration spec.
+> Default location is `./_modernization-control/.kiro/` at the portfolio root; if
+> `modernization.md` specifies a different location or owner, use that.
 
 ### P-3 — Order the services leaf-first
 Topologically sort the service graph leaf-first; merge cyclic service pairs into one
@@ -192,13 +196,17 @@ combined spec. Write `_modernization-control/_portfolio-plan.md` (Portfolio-Mani
 template). Leaf-first here protects **contract stability** (a service's API is pinned
 before its callers are rebuilt against it).
 
-### P-4 — Generate one spec per service (into each service's own repo)
+### P-4 — Generate one spec per service (centralized)
 For each service in portfolio order, create
-`<service-repo>/.kiro/specs/modernize-<service-slug>/` with `requirements.md`,
+`_modernization-control/.kiro/specs/modernize-<service-slug>/` with `requirements.md`,
 `design.md`, `tasks.md` from the Unit templates, grounded in that service's analysis,
 its registry entry (the inbound contract it must preserve), and the contracts of the
-services it calls. The source→target pair drives `design.md`'s idiom/framework/library
-mapping. Each service spec must:
+services it calls. **Every spec is centralized — none are written into the service
+repos.** Because the spec is now decoupled from the repo it modifies, each spec's
+`requirements.md` MUST carry a `Target repo:` header naming the repo whose code the
+spec converts, so the executor knows where the resulting code edits land. The
+source→target pair drives `design.md`'s idiom/framework/library mapping. Each service
+spec must:
 - preserve its **inbound API contract exactly** (same routes, shapes, codes, event
   schemas) so callers — converted or not — are unaffected;
 - depend only on the **frozen contracts** of the services it calls;
@@ -210,13 +218,14 @@ mapping. Each service spec must:
 decide whether it is large/complex enough to warrant exploding into module specs:
 - **Below threshold** (small/simple service) → a **single** service spec. Stop here
   for that service.
-- **At/above threshold** → additionally run the **Track M routine one level down**
-  inside that service's repo: build the module inventory from that service's md, pin
+- **At/above threshold** → additionally run the **Track M routine one level down**,
+  still writing centrally: build the module inventory from that service's md, pin
   **function-signature** contracts for its internal modules in
-  `<service-repo>/.kiro/specs/modernization-contracts/contracts.md`, order modules
-  leaf-first, and emit `<service-repo>/.kiro/specs/modernize-<service>-<module>/`
-  specs. The service's own network contract stays the outer boundary; the module
-  specs decompose its internals.
+  `_modernization-control/.kiro/specs/<service-slug>-contracts/contracts.md`, order
+  modules leaf-first, and emit
+  `_modernization-control/.kiro/specs/modernize-<service-slug>-<module-slug>/` specs
+  (each also carrying the same `Target repo:` header). The service's own network
+  contract stays the outer boundary; the module specs decompose its internals.
 
 Threshold signal (use what the analysis provides): treat a service as "complex" when,
 e.g., it has many internal modules (≈8+), high LOC, or several distinct data
@@ -255,13 +264,15 @@ Conversion model: full rewrite, big-bang, integrated and end-to-end tested at th
 Ordering: leaf-first across services. Execute top to bottom. Supervised.
 Control workspace: {{_modernization-control/}}
 
+Control workspace: _modernization-control/.kiro/ (holds ALL specs + registry + plan)
+
 ## Service order
-| # | Service (repo) | Detected source | Spec location | Depends on | Exploded? | Status |
-|---|----------------|-----------------|---------------|-----------|-----------|--------|
-| 1 | {{svc}} | {{SOURCE_LANG}} | <repo>/.kiro/specs/modernize-{{slug}} | (none — leaf) | no | ☐ |
-| 2 | {{svc}} | {{SOURCE_LANG}} | <repo>/.kiro/specs/modernize-{{slug}} | {{deps}} | yes (N modules) | ☐ |
-| … | … | … | … | … | … | … |
-| N | Integration | — | _modernization-control/.kiro/specs/modernize-_integration | all services | — | ☐ |
+| # | Service | Detected source | Target repo | Spec location (centralized) | Depends on | Exploded? | Status |
+|---|---------|-----------------|-------------|------------------------------|-----------|-----------|--------|
+| 1 | {{svc}} | {{SOURCE_LANG}} | {{repo path}} | _modernization-control/.kiro/specs/modernize-{{slug}} | (none — leaf) | no | ☐ |
+| 2 | {{svc}} | {{SOURCE_LANG}} | {{repo path}} | _modernization-control/.kiro/specs/modernize-{{slug}} | {{deps}} | yes (N modules) | ☐ |
+| … | … | … | … | … | … | … | … |
+| N | Integration | — | — | _modernization-control/.kiro/specs/modernize-_integration | all services | — | ☐ |
 
 Status: ☐ not started · ◐ in progress · ☑ done
 (Integration row present only when >1 service is converted.)
@@ -341,6 +352,8 @@ Fixed boundary between modules. Internals may be reshaped to be idiomatic in
 ### Unit `requirements.md`  (unit = module in Track M, service in Track P)
 ```markdown
 # Requirements: Modernize {{UNIT}} ({{SOURCE_LANG}} → {{TARGET_LANG}})
+
+Target repo: {{repo path this spec converts — Track P only; the code edits land here}}
 
 ## Introduction
 Convert {{UNIT}} to {{TARGET_LANG}} with behavioral parity. Its frozen boundary is
