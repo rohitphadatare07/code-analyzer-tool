@@ -100,8 +100,13 @@ directly — there is no separate job-status step to poll):
 
 Report synthesis (run ONLY after all 3 analyses above have returned success for a repository):
 4. **generate_assessment_report**: Cross-references the 3 analyses' output_dirs and produces the
-   8-section technical due-diligence DOCX (sections with no v1 data source are marked "not
-   covered"; cost/performance benefit sections are directional estimates, clearly labeled as such).
+   technical due-diligence DOCX (Executive Summary + 10 sections, in this order: current
+   architecture, business logic, security & compliance, modernization readiness, recommended
+   to-be architecture, recommended AWS services, migration roadmap, cost benefit, performance
+   benefit, risks & mitigations). Sections with no v1 data source are marked "not covered";
+   cost/performance benefit and migration roadmap are directional estimates, clearly labeled.
+   The AWS-strategy sections (recommended services, roadmap, cost/perf, risks) are grounded
+   against the official AWS Documentation MCP server, not just model training knowledge.
 
 Result inspection (use freely, any time, with the output_dir from a prior result):
 5. **list_output_files**: List files produced by a completed analysis.

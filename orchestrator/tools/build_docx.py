@@ -1,35 +1,44 @@
 """
 DOCX Report Assembly
 
-Renders the 8-section technical due-diligence report from a report_content
-dict into a .docx file. Sections with no v1 data source (infrastructure due
-diligence, vulnerabilities/license, consolidated to-be architecture) are
-rendered as an explicit "not covered" placeholder - never fabricated.
+Renders the technical due-diligence report from a report_content dict into a
+.docx file: an Executive Summary followed by 10 numbered sections. Sections
+with no v1 data source (security & compliance findings, consolidated to-be
+architecture) are rendered as an explicit "not covered" placeholder - never
+fabricated.
 """
 
 import os
 from docx import Document
 
 SECTION_TITLES = [
-    "Infrastructure Due Diligence",
-    "As-Is Code Quality & Recommendations",
-    "Application Code Due Diligence",
-    "Vulnerabilities & License Compliance",
-    "Consolidated To-Be Architecture",
+    "Current Architecture of the Codebase",
+    "Business Logic & Domain Understanding",
+    "Security & Compliance Findings",
+    "Modernization Readiness",
+    "Recommended To-Be Architecture",
     "Recommended AWS Service Usage",
+    "Migration Roadmap",
     "Cost Benefit",
-    "Performance Benefit",
+    "Performance & Reliability Benefit",
+    "Risks & Mitigations",
 ]
 
 # 1-indexed section numbers with no v1 data source.
-NOT_COVERED_SECTIONS = {1, 4, 5}
+NOT_COVERED_SECTIONS = {3, 5}
 
-NOT_COVERED_NOTE = (
-    "Not covered in this engagement. This section requires tooling not yet wired into "
-    "the v1 assessment platform (AWS Migration Evaluator / discovery for infrastructure "
-    "due diligence, Sonar/BlackDuck for vulnerabilities and license compliance, and a "
-    "cross-repo portfolio analysis for consolidated to-be architecture)."
-)
+NOT_COVERED_NOTES = {
+    3: (
+        "Not covered in this engagement. Security vulnerability and license-compliance "
+        "scanning (Sonar / BlackDuck integration) is not yet wired into the v1 assessment "
+        "platform."
+    ),
+    5: (
+        "Not covered in this engagement. A consolidated to-be architecture requires "
+        "cross-repository portfolio analysis, which is not yet wired into the v1 "
+        "assessment platform."
+    ),
+}
 
 
 def build_docx(report_content: dict, output_path: str) -> str:
@@ -37,9 +46,11 @@ def build_docx(report_content: dict, output_path: str) -> str:
     report_content: {
         "client_name": str,
         "repos": [str, ...],
-        "sections": {"2": "...", "3": "...", "6": "...", "7": "...", "8": "..."}
+        "executive_summary": "...",
+        "sections": {"1": "...", "2": "...", "4": "...", "6": "...", "7": "...",
+                     "8": "...", "9": "...", "10": "..."}
     }
-    Sections 1/4/5 are always rendered via NOT_COVERED_NOTE regardless of input.
+    Sections 3/5 are always rendered via NOT_COVERED_NOTES regardless of input.
     Returns output_path.
     """
     doc = Document()
@@ -50,13 +61,19 @@ def build_docx(report_content: dict, output_path: str) -> str:
     if report_content.get('repos'):
         doc.add_paragraph('Repositories assessed: ' + ', '.join(report_content['repos']))
 
+    if report_content.get('executive_summary'):
+        doc.add_heading('Executive Summary', level=1)
+        for para in str(report_content['executive_summary']).split('\n\n'):
+            if para.strip():
+                doc.add_paragraph(para.strip())
+
     sections = report_content.get('sections', {})
 
     for i, heading in enumerate(SECTION_TITLES, start=1):
         doc.add_heading(f"{i}. {heading}", level=1)
         if i in NOT_COVERED_SECTIONS:
             p = doc.add_paragraph()
-            run = p.add_run(NOT_COVERED_NOTE)
+            run = p.add_run(NOT_COVERED_NOTES[i])
             run.italic = True
             continue
         content = sections.get(str(i)) or sections.get(i)
