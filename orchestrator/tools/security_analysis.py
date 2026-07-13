@@ -29,9 +29,19 @@ fallback) its example patterns, reimplemented natively here.
 
 Both scanners degrade gracefully (empty findings + a logged/returned warning)
 if their binary/package isn't installed or a scan otherwise fails - never
-raises, never blocks the rest of the report. Neither tool's *file-scanning*
-behavior has been verified end-to-end in this codebase yet (only each tool's
-underlying detection logic was spot-checked) - see README.md prerequisites.
+raises, never blocks the rest of the report.
+
+Verification status: `osv-scanner`'s exact command shape and JSON parsing
+(including the ecosystem-filtered fixed-version lookup below) were confirmed
+against a real v2.4.0 binary run against a dummy vulnerable package.json/
+package-lock.json this session - the CLI requires an explicit "scan source"
+subcommand ("osv-scanner scan source -r --format json <path>"), which an
+earlier version of this file got wrong (bare "osv-scanner --format json -r
+<path>", which is not valid syntax). `detect-secrets`' file/directory-scan
+behavior was NOT successfully reproduced in a Windows sandbox test (its
+underlying detectors were confirmed working via `--string` mode, but `scan
+--all-files` returned no results even for an unambiguous private-key header)
+- verify this one on the real Linux deployment target before trusting it.
 """
 
 import os
@@ -83,8 +93,18 @@ def _run_osv_scanner(repo_path: str) -> Tuple[List[Dict[str, Any]], Optional[str
     Dependency/CVE scan via osv-scanner. Returns (findings, warning_or_none).
     Never raises - a missing binary or scan failure yields no findings plus a
     warning string surfaced in the report, not a crashed tool call.
+
+    Command verified against a real v2.4.0 binary this session (downloaded and
+    run against a dummy vulnerable package.json/package-lock.json): the CLI
+    requires the explicit "scan source" subcommand - a bare "osv-scanner
+    --format json -r <path>" (this file's original form) is NOT valid syntax
+    and would silently produce no usable output.
+
+    Deliberately NEVER pass --call-analysis: its go/rust support is documented
+    as "(*) Will run build scripts" - that would execute client code, which
+    violates golden rule 1. Do not add it even for better reachability data.
     """
-    cmd = ["osv-scanner", "--format", "json", "-r", repo_path]
+    cmd = ["osv-scanner", "scan", "source", "-r", "--format", "json", repo_path]
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=SCA_TIMEOUT_SECONDS,
@@ -122,7 +142,7 @@ def _run_osv_scanner(repo_path: str) -> Tuple[List[Dict[str, Any]], Optional[str
                     "aliases": vuln.get("aliases", []) or [],
                     "summary": (vuln.get("summary") or "").strip(),
                     "severity": _extract_osv_severity(vuln),
-                    "fixed_version": _extract_osv_fixed_version(vuln),
+                    "fixed_version": _extract_osv_fixed_version(vuln, package_info),
                 })
     return findings, None
 
@@ -139,8 +159,23 @@ def _extract_osv_severity(vuln: Dict[str, Any]) -> str:
     return "UNKNOWN"
 
 
-def _extract_osv_fixed_version(vuln: Dict[str, Any]) -> str:
+def _extract_osv_fixed_version(vuln: Dict[str, Any], package_info: Dict[str, Any]) -> str:
+    """
+    A single OSV vulnerability entry's "affected" list can span MULTIPLE
+    ecosystems for the same CVE (confirmed against a real scan: one lodash
+    CVE listed both npm/lodash and RubyGems/lodash-rails "affected" blocks
+    with different fixed versions). Filter to the scanned package's own
+    ecosystem+name before reading a "fixed" event, so we never report the
+    wrong ecosystem's fix version.
+    """
+    target_name = package_info.get("name")
+    target_ecosystem = package_info.get("ecosystem")
     for affected in vuln.get("affected", []) or []:
+        affected_pkg = affected.get("package", {}) or {}
+        if target_name and affected_pkg.get("name") != target_name:
+            continue
+        if target_ecosystem and affected_pkg.get("ecosystem") != target_ecosystem:
+            continue
         for rng in affected.get("ranges", []) or []:
             for event in rng.get("events", []) or []:
                 if isinstance(event, dict) and "fixed" in event:

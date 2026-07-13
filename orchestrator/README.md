@@ -113,9 +113,24 @@ Whatever host actually runs `agent.py` (local machine, EC2, or the container bui
   logged warning rather than failing the whole report (`tools/visuals.py`).
 - **`osv-scanner` binary** — required for section 3's dependency/CVE scan
   (`security_compliance_agent`). A single static Go binary from the
-  [google/osv-scanner](https://github.com/google/osv-scanner) project — download a release
-  binary and put it on `PATH`. Not pip-installable. If missing, the dependency/CVE scan is
-  skipped with a warning, not a failure (`tools/security_analysis.py`).
+  [google/osv-scanner](https://github.com/google/osv-scanner) project. Not pip-installable.
+  Verified this session against a real v2.4.0 binary (downloaded and run against a dummy
+  vulnerable `package.json`/`package-lock.json`) — confirms the exact command shape
+  `security_analysis.py` uses: `osv-scanner scan source -r --format json <path>` (the
+  `scan source` subcommand is required; a bare `osv-scanner --format json -r <path>` is
+  invalid syntax). Install options, per the project's own docs:
+  - **Linux/macOS/Windows, prebuilt binary** (recommended): download from the
+    [releases page](https://github.com/google/osv-scanner/releases/latest), e.g.
+    `osv-scanner_windows_amd64.exe` / `osv-scanner_linux_amd64` / `osv-scanner_darwin_amd64`,
+    put it on `PATH` (rename to `osv-scanner`/`osv-scanner.exe`).
+  - **Homebrew** (macOS/Linux): `brew install osv-scanner`
+  - **Scoop** (Windows): `scoop install osv-scanner`
+  - **WinGet** (Windows): `winget install Google.OSVScanner`
+  - **Arch Linux**: `pacman -S osv-scanner` · **Alpine**: `apk add osv-scanner`
+  - **Go install** (needs Go 1.26.2+): `go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest`
+  - **Docker**: `ghcr.io/google/osv-scanner` (e.g. for ad-hoc testing outside the orchestrator's
+    own subprocess call: `docker run -v ${PWD}:/src ghcr.io/google/osv-scanner scan source /src`)
+  If the binary is missing, the dependency/CVE scan is skipped with a warning, not a failure.
 - **`detect-secrets`** — required for section 3's secrets scan. Installed via
   `requirements.txt` (pip), which also creates the `detect-secrets` console script this tool
   shells out to — no separate binary download needed, unlike the two above. If missing (or
