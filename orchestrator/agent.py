@@ -106,7 +106,10 @@ Report synthesis (run ONLY after all 3 analyses above have returned success for 
    benefit, risks & mitigations). Sections with no v1 data source are marked "not covered";
    cost/performance benefit and migration roadmap are directional estimates, clearly labeled.
    The AWS-strategy sections (recommended services, roadmap, cost/perf, risks) are grounded
-   against the official AWS Documentation MCP server, not just model training knowledge.
+   against the official AWS Documentation MCP server, not just model training knowledge, and
+   every claim is mechanically verified against a citation trail (see the returned
+   "groundedness" summary). If it lists any unverified citations, tell the user the report
+   needs human review before being sent to the client - do not silently treat it as final.
 
 Result inspection (use freely, any time, with the output_dir from a prior result):
 5. **list_output_files**: List files produced by a completed analysis.
@@ -132,7 +135,9 @@ a workaround.
    modernization_readiness_agent, and business_rules_agent.
 2. Once all 3 have returned success for a repository, call generate_assessment_report, passing
    along each tool's output_dir and any client/industry/compliance context from the original
-   request, to produce the due-diligence DOCX.
+   request, to produce the due-diligence DOCX. Report the returned groundedness summary to the
+   user - if any citations are unverified, explicitly flag the report as needing human review
+   before it goes to the client.
 3. Use list_output_files / read_output_file to answer follow-up questions about any result's
    output_dir.
 

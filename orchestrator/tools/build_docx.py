@@ -48,9 +48,13 @@ def build_docx(report_content: dict, output_path: str) -> str:
         "repos": [str, ...],
         "executive_summary": "...",
         "sections": {"1": "...", "2": "...", "4": "...", "6": "...", "7": "...",
-                     "8": "...", "9": "...", "10": "..."}
+                     "8": "...", "9": "...", "10": "..."},
+        "sources": ["https://docs.aws.amazon.com/...", ...]  # optional
     }
     Sections 3/5 are always rendered via NOT_COVERED_NOTES regardless of input.
+    "sources", if present, is rendered as a final appendix - these are AWS
+    documentation URLs the synthesis agent actually retrieved and cited while
+    drafting sections 6-10 (see grounding.py), not a general reading list.
     Returns output_path.
     """
     doc = Document()
@@ -83,6 +87,14 @@ def build_docx(report_content: dict, output_path: str) -> str:
         for para in str(content).split('\n\n'):
             if para.strip():
                 doc.add_paragraph(para.strip())
+
+    if report_content.get('sources'):
+        doc.add_heading('Sources', level=1)
+        doc.add_paragraph(
+            'AWS documentation referenced while preparing the recommendations in this report:'
+        )
+        for url in report_content['sources']:
+            doc.add_paragraph(url, style='List Bullet')
 
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     doc.save(output_path)
