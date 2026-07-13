@@ -40,6 +40,18 @@ ANALYSIS_TDS = {
 WORKSPACE_ROOT = os.getenv("ASSESSMENT_WORKSPACE", "/tmp/atx-assessments")
 ANALYSIS_TIMEOUT_SECONDS = int(os.getenv("ANALYSIS_TIMEOUT_SECONDS", "1800"))
 
+# Appended to every analysis TD's additionalPlanContext (all 3 TDs, not just
+# comprehensive-codebase-analysis) so any diagram any TD produces - architecture,
+# flow, data model, sequence, whatever - comes back as a parseable Mermaid code
+# block. Downstream, tools/synthesis.py's diagram prompts look for exactly this
+# and reuse it faithfully instead of inventing a diagram from prose.
+MERMAID_DIAGRAM_INSTRUCTION = (
+    "Any diagrams you generate in your output MUST be written as Mermaid code blocks "
+    "(```mermaid ... ```) - not images, ASCII art, or any other diagramming syntax. "
+    "This applies to every diagram you produce (architecture, flow, data model, "
+    "sequence, or otherwise), not just one section of your output."
+)
+
 
 def _extract_repo_name(source: str) -> str:
     if not source:
@@ -79,12 +91,16 @@ def _extract_params(query: str, schema_prompt: str) -> Dict[str, Any]:
 def _clone_repo(source: str, dest: str) -> None:
     """Fetch a READ-ONLY checkout of source into dest. Git URL or local path."""
     if os.path.isdir(source):
+        logger.info(f"Copying local repo {source} -> {dest}")
         shutil.copytree(source, dest)
         return
+    logger.info(f"Cloning {source} -> {dest}")
     subprocess.run(
         ["git", "clone", "--depth", "1", source, dest],
         check=True, capture_output=True, text=True, timeout=300,
+        stdin=subprocess.DEVNULL,
     )
+    logger.info(f"Clone finished: {dest}")
 
 
 def _run_atx_exec(td_name: str, repo_path: str, additional_context: str) -> Dict[str, Any]:
@@ -101,11 +117,17 @@ def _run_atx_exec(td_name: str, repo_path: str, additional_context: str) -> Dict
         # language context). JSON has no such ambiguity regardless of what's inside.
         cmd += ["--configuration", json.dumps({"additionalPlanContext": additional_context})]
     cmd += ["-x", "-t"]
+    logger.info(f"Running (cwd={repo_path}, timeout={ANALYSIS_TIMEOUT_SECONDS}s): {' '.join(cmd)}")
     try:
         proc = subprocess.run(
             cmd, cwd=repo_path, capture_output=True, text=True,
-            timeout=ANALYSIS_TIMEOUT_SECONDS,
+            timeout=ANALYSIS_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
         )
+        logger.info(f"atx exec finished rc={proc.returncode} for {td_name}")
+        if proc.stdout:
+            logger.info(f"atx stdout (last 1000 chars): {proc.stdout[-1000:]}")
+        if proc.returncode != 0 and proc.stderr:
+            logger.warning(f"atx stderr (last 1000 chars): {proc.stderr[-1000:]}")
         return {
             "returncode": proc.returncode,
             "stdout": proc.stdout[-20000:],
@@ -113,6 +135,7 @@ def _run_atx_exec(td_name: str, repo_path: str, additional_context: str) -> Dict
             "command": " ".join(cmd),
         }
     except subprocess.TimeoutExpired as e:
+        logger.warning(f"atx exec timed out after {ANALYSIS_TIMEOUT_SECONDS}s for {td_name}")
         return {
             "returncode": -1,
             "stdout": (e.stdout or "")[-20000:] if isinstance(e.stdout, str) else "",
@@ -124,6 +147,14 @@ def _run_atx_exec(td_name: str, repo_path: str, additional_context: str) -> Dict
 
 
 def _run_analysis(td_name: str, source: str, additional_context: str, job_prefix: str) -> Dict[str, Any]:
+    # Always appended, regardless of what context the caller supplied (or didn't) -
+    # every analysis TD run gets the Mermaid-diagram instruction, not just requests
+    # that happened to mention diagrams.
+    additional_context = (
+        f"{additional_context}\n\n{MERMAID_DIAGRAM_INSTRUCTION}"
+        if additional_context else MERMAID_DIAGRAM_INSTRUCTION
+    )
+
     repo_name = _extract_repo_name(source)
     job_name = f"{job_prefix}-{repo_name}-{int(time.time())}"
     workdir = os.path.join(WORKSPACE_ROOT, job_name)

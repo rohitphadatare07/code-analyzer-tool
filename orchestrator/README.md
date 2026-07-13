@@ -29,17 +29,40 @@ async job queue or status-polling step. See `tools/assessmenttransform.py`.
 `generate_assessment_report` (`tools/synthesis.py`) runs as **two separate agent calls**:
 1. A codebase-grounded call (report sections 1/2/4) given **zero tools** — structurally
    incapable of citing anything but the analysis findings it's handed.
-2. A strategy call (sections 6-10 + executive summary) given the official **AWS
+2. A strategy call (sections 5-10 + executive summary) given the official **AWS
    Documentation MCP server**'s tools (`search_documentation`, `read_documentation`,
    `recommend`, launched via `uvx`), so AWS service/migration recommendations are grounded
    in real documentation, not just model training knowledge.
 
-Every factual sentence in both calls must carry an inline citation tag
-(`[[finding:...]]` / `[[doc:...]]`), which `tools/grounding.py` verifies mechanically against
-that call's actual tool-call trace before the report is rendered. `build_docx.py` strips the
-tags for display and lists cited AWS doc URLs as a "Sources" appendix. Report sections 3
-(Security & Compliance) and 5 (Recommended To-Be Architecture) have no v1 data source and
-always render as an explicit "not covered" placeholder — never fabricated.
+Every factual sentence inside a section's narrative text must carry an inline citation tag
+(`[[finding:...]]` / `[[doc:...]]`) — never inside a table cell, chart value, or diagram
+node/edge — which `tools/grounding.py` verifies mechanically against that call's actual
+tool-call trace before the report is rendered. `build_docx.py` strips the tags for display
+and lists cited AWS doc URLs as a "Sources" appendix. Report section 3 (Security &
+Compliance) has no v1 data source and always renders as an explicit "not covered"
+placeholder — never fabricated. Section 5 (Recommended To-Be Architecture) is **always**
+synthesized by the strategy call regardless of whether the engagement covers one repository
+or many — it is no longer gated behind the removed cross-repo portfolio TD; for multiple
+repositories the strategy call produces one consolidated architecture spanning all of them.
+
+Every analysis TD is instructed to emit any diagram it produces as a fenced ```mermaid```
+code block — `assessmenttransform.py`'s `MERMAID_DIAGRAM_INSTRUCTION` is appended to all 3
+TDs' `additionalPlanContext` on every run, not just `comprehensive-codebase-analysis`. The
+current-architecture diagram (section 1) and to-be-architecture diagram (section 5) are then
+built by extracting that real Mermaid diagram from the findings (whichever source it turns
+up in) and translating it faithfully into the render schema — not invented fresh from a
+prose summary. The prompt only falls back to inventing one from prose if no such diagram
+exists anywhere in the findings (e.g. the installed TD version doesn't honor the instruction).
+
+Each section is broken into subsections (heading + narrative + optional table), not one
+prose blob, and specific sections carry section-level tables/charts/diagrams (`tools/visuals.py`):
+a Modernization Readiness scorecard bar chart (section 4, reusing the readiness TD's own
+`report.json` scores rather than inventing them), a Migration Roadmap timeline chart
+(section 7), and Graphviz boxes-and-arrows architecture diagrams for the current (section 1)
+and recommended to-be (section 5, always produced regardless of repo count) architecture.
+Any chart/diagram/table without real supporting data in the findings is omitted, not
+fabricated (section 5's diagram/narrative is the one exception — it's mandatory), and a
+missing Graphviz `dot` binary just skips that one diagram rather than failing the whole report.
 
 ### Why one string arg?
 
@@ -56,7 +79,8 @@ new tools consistent with this pattern.
 | `agent.py` | Orchestrator: system prompt, tool wiring, AgentCore entrypoint |
 | `tools/assessmenttransform.py` | The 3 per-repo analysis tools + `list_output_files`/`read_output_file` |
 | `tools/synthesis.py` | `generate_assessment_report` — the two-call synthesis described above |
-| `tools/build_docx.py` | Pure DOCX rendering (no AWS calls) — Executive Summary + 10 sections + Sources appendix |
+| `tools/build_docx.py` | Pure DOCX rendering (no AWS calls) — Executive Summary + 10 sections (each with subsections/tables/charts/diagrams) + Sources appendix |
+| `tools/visuals.py` | Pure chart (matplotlib) and diagram (Graphviz) rendering to PNG — every function degrades to `None` on failure instead of raising |
 | `tools/grounding.py` | Citation extraction, tool-call trace capture, mechanical groundedness verification |
 | `tools/memory_client.py` | AgentCore Memory client |
 | `tools/memory_hooks.py` | Short-term memory hooks |
@@ -74,14 +98,21 @@ Whatever host actually runs `agent.py` (local machine, EC2, or the container bui
 - **`uvx`** — provided by the `uv` package (already in `requirements.txt`), used to launch
   the AWS Documentation MCP server on demand. Needs outbound internet access to
   `docs.aws.amazon.com`.
+- **Graphviz (`dot` binary)** — required for the architecture diagrams (section 1's
+  current-architecture diagram, section 5's recommended to-be architecture diagram). Install via
+  `apt-get install graphviz` / `brew install graphviz` / the Windows installer, then confirm
+  `dot -V` is on PATH. The `graphviz` pip package (in `requirements.txt`) only wraps this
+  binary, it doesn't bundle it. If `dot` isn't found, that one diagram is skipped with a
+  logged warning rather than failing the whole report (`tools/visuals.py`).
 - **AWS credentials** with at least `bedrock:InvokeModel` (env vars, `~/.aws/credentials`,
   or an instance role).
 
 > **Known gap:** `Dockerfile` in this directory currently installs only the Python
-> dependencies — it does **not** install `git` or the `atx` CLI. A container built from it
-> as-is can hold a conversation but will fail with `FileNotFoundError` on any actual repo
-> analysis. Fix this before relying on the Docker path (see `scaled-execution-containers/container/Dockerfile`
-> for the `atx` install command to copy over).
+> dependencies — it does **not** install `git`, the `atx` CLI, or Graphviz's `dot` binary. A
+> container built from it as-is can hold a conversation but will fail with `FileNotFoundError`
+> on any actual repo analysis, and will silently skip both architecture diagrams. Fix this
+> before relying on the Docker path (see `scaled-execution-containers/container/Dockerfile`
+> for the `atx` install command to copy over; Graphviz is a standard apt/distro package).
 
 ## Local Development
 

@@ -10,9 +10,20 @@ client source code.
 """
 
 import os
+import sys
 import json
 import logging
 from datetime import datetime
+
+# Configure logging once, here, before any other module's logger.info/warning/error
+# calls fire. Without a handler, Python's default "handler of last resort" only
+# prints WARNING+ to stderr - INFO-level progress logs (e.g. "CODEBASE ANALYSIS
+# AGENT INVOKED", the atx subprocess command/output) would be silently dropped.
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    stream=sys.stdout,
+)
 
 # Monkey-patch Strands streaming to fix type concatenation bug
 # (upstream issue: streaming.py line 216 does str += int when tool input has integer values)
@@ -103,8 +114,11 @@ Report synthesis (run ONLY after all 3 analyses above have returned success for 
    technical due-diligence DOCX (Executive Summary + 10 sections, in this order: current
    architecture, business logic, security & compliance, modernization readiness, recommended
    to-be architecture, recommended AWS services, migration roadmap, cost benefit, performance
-   benefit, risks & mitigations). Sections with no v1 data source are marked "not covered";
-   cost/performance benefit and migration roadmap are directional estimates, clearly labeled.
+   benefit, risks & mitigations), with supporting tables and diagrams where the underlying
+   data supports them. Only the security & compliance section has no v1 data source and is
+   marked "not covered" - the recommended to-be architecture section is always produced,
+   for one repo or many. Cost/performance benefit and migration roadmap are directional
+   estimates, clearly labeled.
    The AWS-strategy sections (recommended services, roadmap, cost/perf, risks) are grounded
    against the official AWS Documentation MCP server, not just model training knowledge, and
    every claim is mechanically verified against a citation trail (see the returned

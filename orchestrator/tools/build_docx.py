@@ -2,14 +2,33 @@
 DOCX Report Assembly
 
 Renders the technical due-diligence report from a report_content dict into a
-.docx file: an Executive Summary followed by 10 numbered sections. Sections
-with no v1 data source (security & compliance findings, consolidated to-be
-architecture) are rendered as an explicit "not covered" placeholder - never
-fabricated.
+.docx file: an Executive Summary followed by 10 numbered sections, each broken
+into subsections with narrative prose, tables, and (for specific sections)
+charts/diagrams. Section 3 (no v1 data source - Sonar/BlackDuck not wired up)
+is rendered as an explicit "not covered" placeholder - never fabricated.
+Section 5 (Recommended To-Be Architecture) is always synthesized by the
+strategy agent, regardless of how many repositories are in scope - it is a
+normal section like the others, not a placeholder.
+
+report_content["sections"]["<n>"] shape:
+    {"subsections": [{"heading": "...", "narrative": "...", "table": {...}?}],
+     "tables": [...]?, "chart": {...}?, "diagram": {...}?}
+Chart/diagram PNGs are rendered on demand (tools/visuals.py) to
+"<output_path stem>_images/" (sibling to the .docx); a section whose data is
+missing or fails to render (e.g. Graphviz's `dot` binary isn't installed)
+simply has no image for that slot - visuals.py's renderers never raise.
 """
 
 import os
+import logging
 from docx import Document
+from docx.shared import Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+from . import visuals
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 SECTION_TITLES = [
     "Current Architecture of the Codebase",
@@ -25,7 +44,7 @@ SECTION_TITLES = [
 ]
 
 # 1-indexed section numbers with no v1 data source.
-NOT_COVERED_SECTIONS = {3, 5}
+NOT_COVERED_SECTIONS = {3}
 
 NOT_COVERED_NOTES = {
     3: (
@@ -33,31 +52,79 @@ NOT_COVERED_NOTES = {
         "scanning (Sonar / BlackDuck integration) is not yet wired into the v1 assessment "
         "platform."
     ),
-    5: (
-        "Not covered in this engagement. A consolidated to-be architecture requires "
-        "cross-repository portfolio analysis, which is not yet wired into the v1 "
-        "assessment platform."
-    ),
 }
+
+# Confirmed against an actual python-docx install this session - part of the default
+# template's built-in table-style gallery. Fallback below is cheap insurance only.
+TABLE_STYLE = "Light Grid Accent 1"
+
+
+def _add_table(doc, headers, rows, style=TABLE_STYLE):
+    if not headers or not rows:
+        return
+    table = doc.add_table(rows=1, cols=len(headers))
+    try:
+        table.style = style
+    except KeyError:
+        try:
+            table.style = "Table Grid"
+        except KeyError:
+            pass  # no named table style available; render borderless rather than crash
+
+    hdr_cells = table.rows[0].cells
+    for i, h in enumerate(headers):
+        hdr_cells[i].text = str(h)
+        for run in hdr_cells[i].paragraphs[0].runs:
+            run.bold = True
+
+    for row in rows:
+        row_cells = table.add_row().cells
+        for i in range(len(headers)):
+            row_cells[i].text = str(row[i]) if i < len(row) else ""
+    doc.add_paragraph()  # spacing after the table
+
+
+def _add_image(doc, image_path, width_inches: float = 6.0):
+    if not image_path or not os.path.isfile(image_path):
+        return
+    doc.add_picture(image_path, width=Inches(width_inches))
+    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+
+def _add_narrative(doc, text):
+    for para in str(text or "").split("\n\n"):
+        if para.strip():
+            doc.add_paragraph(para.strip())
+
+
+def _render_section_visual(kind, data, images_dir, i):
+    """kind: 'diagram' or 'chart'. Returns an image path or None."""
+    if not data or not isinstance(data, dict):
+        return None
+    if kind == "diagram":
+        return visuals.render_architecture_diagram(
+            data, os.path.join(images_dir, f"section_{i}_diagram.png"))
+    if kind == "chart":
+        out = os.path.join(images_dir, f"section_{i}_chart.png")
+        chart_type = data.get("type")
+        if chart_type == "scorecard_bar":
+            return visuals.render_scorecard_bar_chart(data, out)
+        if chart_type == "roadmap_timeline":
+            return visuals.render_roadmap_timeline_chart(data, out)
+        logger.warning(f"Section {i}: unknown chart type {chart_type!r}, skipping")
+        return None
+    return None
 
 
 def build_docx(report_content: dict, output_path: str) -> str:
     """
-    report_content: {
-        "client_name": str,
-        "repos": [str, ...],
-        "executive_summary": "...",
-        "sections": {"1": "...", "2": "...", "4": "...", "6": "...", "7": "...",
-                     "8": "...", "9": "...", "10": "..."},
-        "sources": ["https://docs.aws.amazon.com/...", ...]  # optional
-    }
-    Sections 3/5 are always rendered via NOT_COVERED_NOTES regardless of input.
-    "sources", if present, is rendered as a final appendix - these are AWS
-    documentation URLs the synthesis agent actually retrieved and cited while
-    drafting sections 6-10 (see grounding.py), not a general reading list.
-    Returns output_path.
+    Section 3 always renders via NOT_COVERED_NOTES regardless of input. Section 5
+    is a normal synthesized section (see module docstring). Tolerates the old
+    flat-string section shape and malformed section dicts defensively (falls back
+    to plain-paragraph rendering) rather than crashing. Returns output_path.
     """
     doc = Document()
+    images_dir = os.path.splitext(output_path)[0] + "_images"
 
     doc.add_heading('Technical Due Diligence Report', level=0)
     if report_content.get('client_name'):
@@ -67,9 +134,7 @@ def build_docx(report_content: dict, output_path: str) -> str:
 
     if report_content.get('executive_summary'):
         doc.add_heading('Executive Summary', level=1)
-        for para in str(report_content['executive_summary']).split('\n\n'):
-            if para.strip():
-                doc.add_paragraph(para.strip())
+        _add_narrative(doc, report_content['executive_summary'])
 
     sections = report_content.get('sections', {})
 
@@ -80,13 +145,49 @@ def build_docx(report_content: dict, output_path: str) -> str:
             run = p.add_run(NOT_COVERED_NOTES[i])
             run.italic = True
             continue
-        content = sections.get(str(i)) or sections.get(i)
-        if not content:
+
+        section = sections.get(str(i)) or sections.get(i)
+        if not section:
             doc.add_paragraph("No content available for this section.")
             continue
-        for para in str(content).split('\n\n'):
-            if para.strip():
-                doc.add_paragraph(para.strip())
+        if isinstance(section, str):          # old flat-string shape, defensive
+            section = {"subsections": [{"heading": "", "narrative": section}]}
+        elif not isinstance(section, dict):
+            doc.add_paragraph("No content available for this section.")
+            continue
+
+        subsections = section.get("subsections") or []
+        if not subsections:
+            doc.add_paragraph("No content available for this section.")
+
+        for sub in subsections:
+            if not isinstance(sub, dict):
+                continue
+            if sub.get("heading"):
+                doc.add_heading(str(sub["heading"]), level=2)
+            _add_narrative(doc, sub.get("narrative", ""))
+            table = sub.get("table")
+            if isinstance(table, dict) and table.get("headers") and table.get("rows"):
+                _add_table(doc, table["headers"], table["rows"])
+
+        for table in (section.get("tables") or []):
+            if not isinstance(table, dict):
+                continue
+            if table.get("title"):
+                doc.add_heading(str(table["title"]), level=3)
+            if table.get("headers") and table.get("rows"):
+                _add_table(doc, table["headers"], table["rows"])
+
+        diagram = section.get("diagram")
+        diagram_path = _render_section_visual("diagram", diagram, images_dir, i)
+        if diagram_path:
+            if isinstance(diagram, dict) and diagram.get("title"):
+                doc.add_heading(str(diagram["title"]), level=3)
+            _add_image(doc, diagram_path)
+
+        chart_path = _render_section_visual("chart", section.get("chart"), images_dir, i)
+        if chart_path:
+            _add_image(doc, chart_path)
 
     if report_content.get('sources'):
         doc.add_heading('Sources', level=1)
