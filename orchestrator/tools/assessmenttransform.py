@@ -95,7 +95,11 @@ def _run_atx_exec(td_name: str, repo_path: str, additional_context: str) -> Dict
     """
     cmd = ["atx", "custom", "def", "exec", "-n", td_name, "-p", repo_path]
     if additional_context:
-        cmd += ["--configuration", f"additionalPlanContext={additional_context}"]
+        # JSON, not "key=value" - the ATX CLI's key=value format splits on commas to
+        # support multiple pairs, which breaks the moment additional_context itself
+        # contains a comma (near-guaranteed for real prefer/avoid lists or natural-
+        # language context). JSON has no such ambiguity regardless of what's inside.
+        cmd += ["--configuration", json.dumps({"additionalPlanContext": additional_context})]
     cmd += ["-x", "-t"]
     try:
         proc = subprocess.run(

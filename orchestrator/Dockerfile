@@ -10,6 +10,9 @@ USER bedrock_agentcore
 
 ENV AWS_REGION=us-east-1
 ENV BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
+# Override at `docker run -e PORT=<port>` to listen on a different port inside
+# the container; still map it externally with `-p <hostport>:<PORT>`.
+ENV PORT=8080
 EXPOSE 8080
 
 CMD ["opentelemetry-instrument", "python", "agent.py"]

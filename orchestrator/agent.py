@@ -217,6 +217,7 @@ def invoke(payload):
 
 
 if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8080"))
     print("Starting ATX Transform Orchestrator...")
-    print("Server will be available at http://localhost:8080")
-    app.run()
+    print(f"Server will be available at http://localhost:{port}")
+    app.run(port=port)
