@@ -13,9 +13,10 @@ Drafted as TWO separate agent calls, not one, so groundedness is structurally
 checkable (Tier 2) rather than just prompted-for:
 
 1. Codebase-grounded call - sections 1 (architecture), 2 (business logic),
-   4 (modernization readiness). Given ZERO tools (not just told not to use
-   them - it structurally cannot call anything). Every narrative sentence must
-   carry a [[finding:<Source Label>]] tag naming which TD it came from.
+   3 (security & compliance), 4 (modernization readiness). Given ZERO tools
+   (not just told not to use them - it structurally cannot call anything).
+   Every narrative sentence must carry a [[finding:<Source Label>]] tag naming
+   which analysis it came from.
 2. Strategy call - sections 5 (recommended to-be architecture), 6 (AWS
    services), 7 (roadmap), 8 (cost benefit), 9 (performance benefit),
    10 (risks), + the executive summary. Given the AWS Documentation MCP
@@ -28,6 +29,12 @@ call, regardless of whether the engagement covers one repository or many - it
 is not gated behind a separate cross-repo TD (that TD was removed from v1;
 see CLAUDE.md). For multiple repositories, the strategy call synthesizes one
 consolidated architecture spanning all of them from the same findings text.
+
+Section 3 (Security & Compliance Findings) is now also a real, synthesized
+section - fed by security_compliance_agent's native osv-scanner (dependency/
+CVE) and detect-secrets (secrets detection) scan output, since no
+transformation definition exists for this. It's drafted by the codebase call
+(no AWS services/recommendations belong here, same as sections 1/2/4).
 
 Diagrams (section 1's current-architecture diagram, section 5's to-be
 architecture diagram) are drawn from REAL diagrams the analysis TDs already
@@ -77,6 +84,7 @@ FINDING_LABELS = {
     "Comprehensive Codebase Analysis",
     "Modernization Readiness Analysis",
     "Business Rules Extraction",
+    "Security & Compliance Analysis",
 }
 
 # Official AWS Documentation MCP server (awslabs). Launched on-demand via uvx,
@@ -96,7 +104,8 @@ _CITATION_RULES_CORE = """Every factual sentence inside a "narrative" field must
 citation tag placed right after the sentence:
 - [[finding:<Source Label>]] for a claim taken from the analysis findings, where
   <Source Label> is EXACTLY one of: "Comprehensive Codebase Analysis",
-  "Modernization Readiness Analysis", "Business Rules Extraction".
+  "Modernization Readiness Analysis", "Business Rules Extraction",
+  "Security & Compliance Analysis".
 - [[doc:<url>]] for a claim taken from an AWS Documentation tool result, where <url>
   is the EXACT url you retrieved via search_documentation/read_documentation this
   turn - never a url you did not actually look up.
@@ -145,10 +154,12 @@ _REAL_DIAGRAM_RULES = """IMPORTANT - REUSE REAL DIAGRAMS, DON'T INVENT FROM SCRA
 Every analysis TD is instructed (via additionalPlanContext) to emit any diagram it produces
 as a fenced ```mermaid code block - this applies to ALL of the findings sources below
 (Comprehensive Codebase Analysis, Modernization Readiness Analysis, Business Rules
-Extraction), not just the codebase one. Before constructing a "diagram" field, search ALL
-of the findings for a ```mermaid block (or, less commonly, a Graphviz DOT block, a PlantUML
-block, or a clearly labeled ASCII box diagram if a TD didn't comply with the Mermaid
-instruction). If you find one:
+Extraction), not just the codebase one. Security & Compliance Analysis is native scanner
+output (osv-scanner/detect-secrets), not an LLM-authored TD, so it won't contain a diagram -
+don't bother searching it for one. Before constructing a "diagram" field, search the
+relevant findings for a ```mermaid block (or, less commonly, a Graphviz DOT block, a
+PlantUML block, or a clearly labeled ASCII box diagram if a TD didn't comply with the
+Mermaid instruction). If you find one:
 - Extract its REAL components and connections and translate them faithfully into this
   schema's {"nodes": [...], "edges": [...]} shape - do not invent additional
   components/connections that aren't present in it, and do not drop real ones you find.
@@ -171,7 +182,7 @@ here; that belongs in a later section you are not drafting.
 
 _CODEBASE_SECTION_GUIDANCE = """
 
-SECTION-SPECIFIC STRUCTURED DATA (this call drafts sections 1, 2, 4 only)
+SECTION-SPECIFIC STRUCTURED DATA (this call drafts sections 1, 2, 3, 4 only)
 
 Section 1 - Current Architecture of the Codebase:
   - Subsections should cover: architecture overview, technology stack (with a table:
@@ -194,6 +205,27 @@ Section 2 - Business Logic & Domain Understanding:
       if the Business Rules Extraction findings give a numbered rules list.
     - {"title": "Core Data Model", "headers": ["Entity", "Key Attributes", "Relationships"],
        "rows": [...]} if the findings describe concrete entities.
+
+Section 3 - Security & Compliance Findings:
+  - The "Security & Compliance Analysis" findings source is native scanner output (a JSON
+    blob with "sca_findings" from osv-scanner and "secrets_findings" from detect-secrets),
+    not TD-authored prose - read it as structured data, not narrative to summarize loosely.
+  - Subsections should cover: dependency/CVE exposure summary, secrets exposure summary. If
+    "warnings" is non-empty in that JSON (e.g. a scanner wasn't installed), say so plainly in
+    the relevant subsection rather than implying a clean scan - a skipped scan is not the
+    same as no findings.
+  - Section-level "tables" (a list, 0-2 entries):
+    - {"title": "Dependency Vulnerabilities", "headers": ["Package", "Version", "Vulnerability ID", "Severity", "Fixed Version"], "rows": [...]}
+      built directly from "sca_findings" entries. Omit if "sca_findings" is empty.
+    - {"title": "Secrets Findings", "headers": ["File", "Line", "Type"], "rows": [...]}
+      built from "secrets_findings" entries - use only "file"/"line"/"type" fields. NEVER
+      surface "hashed_secret", "redacted_match", or any other value verbatim as if it were
+      the secret - those fields are already safe (hashed or redacted) precisely so a raw
+      secret never appears in this report; do not try to be more specific than the source
+      data already redacted for you. Omit this table if "secrets_findings" is empty.
+  - This section has real data now - only fall back to "no content available" (never a
+    fabricated "not covered" placeholder) if the Security & Compliance Analysis findings are
+    completely absent from what you were given.
 
 Section 4 - Modernization Readiness:
   - Subsections should cover: cloud-native maturity assessment, specific anti-patterns
@@ -251,6 +283,16 @@ shape (worked example - illustrative content only, replace with what the finding
          "rows": [["BR-01", "Loyalty discount applies before tax", "Pricing"], ["BR-02", "Orders over $500 require manager approval", "Order Management"]]},
         {"title": "Core Data Model", "headers": ["Entity", "Key Attributes", "Relationships"],
          "rows": [["Order", "id, status, total", "belongs to Customer, has many OrderLines"], ["Customer", "id, loyalty_tier", "has many Orders"]]}
+      ]
+    },
+    "3": {
+      "subsections": [
+        {"heading": "Dependency & CVE Exposure", "narrative": "Three dependencies carry known vulnerabilities, one of them high-severity, all with fixed versions already available. [[finding:Security & Compliance Analysis]]"},
+        {"heading": "Secrets Exposure", "narrative": "No hardcoded secrets were found in the scanned files. [[finding:Security & Compliance Analysis]]"}
+      ],
+      "tables": [
+        {"title": "Dependency Vulnerabilities", "headers": ["Package", "Version", "Vulnerability ID", "Severity", "Fixed Version"],
+         "rows": [["lodash", "4.17.11", "CVE-2020-8203", "HIGH", "4.17.19"], ["requests", "2.19.1", "GHSA-x84v-xcm2-53pg", "MEDIUM", "2.20.0"]]}
       ]
     },
     "4": {
@@ -423,14 +465,16 @@ actually say):
                   "rows": [["Undocumented checkout rollback behavior", "Medium", "High", "Add explicit integration tests for checkout failure paths before cutover"]]}]
     }
   },
-  "executive_summary": "3-5 sentences for a CTO/VP audience: current-state pain points, recommended direction (including the target architecture from section 5), headline benefits. Do NOT substantively summarize section 3 (Security & Compliance) - if mentioned at all, note only that it is recommended as a follow-up phase, since no data exists for it in this engagement. No citation tag needed on the executive summary itself."
+  "executive_summary": "3-5 sentences for a CTO/VP audience: current-state pain points (including any material security/compliance findings from section 3, and the target architecture from section 5), recommended direction, headline benefits. No citation tag needed on the executive summary itself."
 }
 
-Section 3 (Security & Compliance Findings) is handled separately as "not covered" - do NOT
-include it. Section 5 (Recommended To-Be Architecture) IS your responsibility and must
-always be included with real subsections and a real diagram per the guidance above - it is
-NOT a "not covered" section anymore. Base every claim strictly on the findings or
-documentation you actually looked up; do not invent detail not present in either."""
+Section 3 (Security & Compliance Findings) is drafted by your colleague in the OTHER agent
+call (the codebase-grounded one) - do NOT include it here, it's not yours to draft, but you
+MAY reference its headline findings in the executive summary since you're given the
+codebase-facing sections as context. Section 5 (Recommended To-Be Architecture) IS your
+responsibility and must always be included with real subsections and a real diagram per the
+guidance above. Base every claim strictly on the findings or documentation you actually
+looked up; do not invent detail not present in either."""
 
 STRATEGY_SECTIONS_PROMPT = (
     _STRATEGY_INTRO + _CITATION_RULES_CORE
@@ -624,22 +668,23 @@ def generate_assessment_report(query: str) -> Dict[str, Any]:
     Cross-references completed analysis results for one or more repositories and
     produces the due-diligence DOCX (Executive Summary + 10 sections, each with
     subsections, and tables/charts/diagrams for sections that have supporting data).
-    Call this AFTER codebase_analysis_agent, modernization_readiness_agent, and
-    business_rules_agent have all returned success. Returns a groundedness summary
-    alongside the report path - if it lists any unverified citations, flag the report
-    for human review before sending it to the client.
+    Call this AFTER codebase_analysis_agent, modernization_readiness_agent,
+    business_rules_agent, AND security_compliance_agent have all returned success.
+    Returns a groundedness summary alongside the report path - if it lists any
+    unverified citations, flag the report for human review before sending it to the client.
 
     Args:
-        query: Natural language naming each repo and the 3 output_dir paths its analyses
+        query: Natural language naming each repo and the 4 output_dir paths its analyses
             returned, plus any client context, e.g. "Generate the report for repo
             'acme-api': codebase output at /tmp/atx-assessments/codebase-acme-api-.../repo,
             readiness output at .../readiness-acme-api-.../repo, business rules output at
-            .../bizrules-acme-api-.../repo. Client: Acme Corp, industry: healthcare."
+            .../bizrules-acme-api-.../repo, security output at .../security-acme-api-.../findings.
+            Client: Acme Corp, industry: healthcare."
     """
     logger.info("SYNTHESIS/REPORT AGENT INVOKED")
     try:
         params = _extract_params(query, """Extract fields. Return ONLY JSON:
-{"repos": [{"name": "repo-name", "codebase_output_dir": "", "readiness_output_dir": "", "business_rules_output_dir": ""}],
+{"repos": [{"name": "repo-name", "codebase_output_dir": "", "readiness_output_dir": "", "business_rules_output_dir": "", "security_output_dir": ""}],
  "client_name": "", "context": "industry/compliance/other free-text engagement context"}""")
         repos = params.get('repos', [])
         if not repos:
@@ -652,6 +697,7 @@ def generate_assessment_report(query: str) -> Dict[str, Any]:
                 "Comprehensive Codebase Analysis": _read_findings(r.get('codebase_output_dir', '')),
                 "Modernization Readiness Analysis": _read_findings(r.get('readiness_output_dir', '')),
                 "Business Rules Extraction": _read_findings(r.get('business_rules_output_dir', '')),
+                "Security & Compliance Analysis": _read_findings(r.get('security_output_dir', '')),
             }
 
         sections_result = _synthesize_sections(findings_by_repo, params.get('context', ''))

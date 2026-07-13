@@ -4,11 +4,13 @@ DOCX Report Assembly
 Renders the technical due-diligence report from a report_content dict into a
 .docx file: an Executive Summary followed by 10 numbered sections, each broken
 into subsections with narrative prose, tables, and (for specific sections)
-charts/diagrams. Section 3 (no v1 data source - Sonar/BlackDuck not wired up)
-is rendered as an explicit "not covered" placeholder - never fabricated.
-Section 5 (Recommended To-Be Architecture) is always synthesized by the
-strategy agent, regardless of how many repositories are in scope - it is a
-normal section like the others, not a placeholder.
+charts/diagrams. Every section is now a normal synthesized section - section 3
+(Security & Compliance Findings) is fed by security_compliance_agent's native
+osv-scanner/detect-secrets scan output, and section 5 (Recommended To-Be
+Architecture) is always synthesized regardless of repo count - neither is a
+hardcoded placeholder anymore. NOT_COVERED_SECTIONS/NOT_COVERED_NOTES are kept
+as an empty-by-default mechanism for any future section that genuinely has no
+v1 data source, rather than removed outright.
 
 report_content["sections"]["<n>"] shape:
     {"subsections": [{"heading": "...", "narrative": "...", "table": {...}?}],
@@ -43,16 +45,12 @@ SECTION_TITLES = [
     "Risks & Mitigations",
 ]
 
-# 1-indexed section numbers with no v1 data source.
-NOT_COVERED_SECTIONS = {3}
+# 1-indexed section numbers with no v1 data source. Empty now that security/
+# compliance (3) and to-be architecture (5) both have real sources - kept as a
+# mechanism, not deleted, for any future section that genuinely has none.
+NOT_COVERED_SECTIONS = set()
 
-NOT_COVERED_NOTES = {
-    3: (
-        "Not covered in this engagement. Security vulnerability and license-compliance "
-        "scanning (Sonar / BlackDuck integration) is not yet wired into the v1 assessment "
-        "platform."
-    ),
-}
+NOT_COVERED_NOTES = {}
 
 # Confirmed against an actual python-docx install this session - part of the default
 # template's built-in table-style gallery. Fallback below is cheap insurance only.
@@ -118,10 +116,10 @@ def _render_section_visual(kind, data, images_dir, i):
 
 def build_docx(report_content: dict, output_path: str) -> str:
     """
-    Section 3 always renders via NOT_COVERED_NOTES regardless of input. Section 5
-    is a normal synthesized section (see module docstring). Tolerates the old
-    flat-string section shape and malformed section dicts defensively (falls back
-    to plain-paragraph rendering) rather than crashing. Returns output_path.
+    Every section is now a normal synthesized section (see module docstring) -
+    NOT_COVERED_SECTIONS is empty by default. Tolerates the old flat-string
+    section shape and malformed section dicts defensively (falls back to
+    plain-paragraph rendering) rather than crashing. Returns output_path.
     """
     doc = Document()
     images_dir = os.path.splitext(output_path)[0] + "_images"

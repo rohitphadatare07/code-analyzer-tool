@@ -3,10 +3,11 @@
 ATX Assessment Orchestrator Agent
 
 A Strands agent that orchestrates READ-ONLY technical due-diligence analysis
-using the ATX CLI. Coordinates 3 assessment sub-agents (agents-as-tools),
-one per whitelisted analysis transformation definition, plus result-inspection
-tools. This orchestrator never modifies, executes, or pushes changes to
-client source code.
+using the ATX CLI. Coordinates 4 assessment sub-agents (agents-as-tools) -
+3 per whitelisted analysis transformation definition, plus a native security/
+compliance scanner (osv-scanner + detect-secrets, no TD exists for this) -
+plus result-inspection tools. This orchestrator never modifies, executes, or
+pushes changes to client source code.
 """
 
 import os
@@ -48,13 +49,14 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 codebase_analysis_agent = None
 modernization_readiness_agent = None
 business_rules_agent = None
+security_compliance_agent = None
 list_output_files = None
 read_output_file = None
 generate_assessment_report = None
 
 def _load_tools():
     global codebase_analysis_agent, modernization_readiness_agent, business_rules_agent
-    global list_output_files, read_output_file, generate_assessment_report
+    global security_compliance_agent, list_output_files, read_output_file, generate_assessment_report
     if codebase_analysis_agent is None:
         from tools.assessmenttransform import (
             codebase_analysis_agent as _codebase,
@@ -63,10 +65,12 @@ def _load_tools():
             list_output_files as _list,
             read_output_file as _read,
         )
+        from tools.security_analysis import security_compliance_agent as _security
         from tools.synthesis import generate_assessment_report as _report
         codebase_analysis_agent = _codebase
         modernization_readiness_agent = _readiness
         business_rules_agent = _bizrules
+        security_compliance_agent = _security
         list_output_files = _list
         read_output_file = _read
         generate_assessment_report = _report
@@ -108,17 +112,20 @@ directly — there is no separate job-status step to poll):
    maturity and AWS service recommendations per pattern.
 3. **business_rules_agent**: Runs AWS/business-rules-extraction — numbered business rules, data
    model, workflows.
+4. **security_compliance_agent**: Runs native dependency/CVE scanning (osv-scanner) and secrets
+   detection (detect-secrets) — no transformation definition exists for this, so it scans the
+   cloned repository directly. Static analysis only, never executes client code. Missing
+   scanner binaries degrade to a warning, not a failure.
 
-Report synthesis (run ONLY after all 3 analyses above have returned success for a repository):
-4. **generate_assessment_report**: Cross-references the 3 analyses' output_dirs and produces the
+Report synthesis (run ONLY after all 4 analyses above have returned success for a repository):
+5. **generate_assessment_report**: Cross-references the 4 analyses' output_dirs and produces the
    technical due-diligence DOCX (Executive Summary + 10 sections, in this order: current
    architecture, business logic, security & compliance, modernization readiness, recommended
    to-be architecture, recommended AWS services, migration roadmap, cost benefit, performance
    benefit, risks & mitigations), with supporting tables and diagrams where the underlying
-   data supports them. Only the security & compliance section has no v1 data source and is
-   marked "not covered" - the recommended to-be architecture section is always produced,
-   for one repo or many. Cost/performance benefit and migration roadmap are directional
-   estimates, clearly labeled.
+   data supports them. Every section is now synthesized from real findings, for one repo or
+   many. Cost/performance benefit and migration roadmap are directional estimates, clearly
+   labeled.
    The AWS-strategy sections (recommended services, roadmap, cost/perf, risks) are grounded
    against the official AWS Documentation MCP server, not just model training knowledge, and
    every claim is mechanically verified against a citation trail (see the returned
@@ -126,14 +133,18 @@ Report synthesis (run ONLY after all 3 analyses above have returned success for 
    needs human review before being sent to the client - do not silently treat it as final.
 
 Result inspection (use freely, any time, with the output_dir from a prior result):
-5. **list_output_files**: List files produced by a completed analysis.
-6. **read_output_file**: Read a specific output file's contents.
+6. **list_output_files**: List files produced by a completed analysis.
+7. **read_output_file**: Read a specific output file's contents.
 
 # These are the ONLY transformation definitions you may invoke
 
 - AWS/comprehensive-codebase-analysis
 - AWS/modernization-readiness-analysis
 - AWS/business-rules-extraction
+
+security_compliance_agent does NOT invoke a transformation definition at all - it runs
+native, read-only scanners (osv-scanner, detect-secrets) directly against the cloned repo.
+It is still allowed and expected; this list only bounds which TDs may be invoked via `atx`.
 
 Do NOT invoke, mention as available, or attempt to run any other transformation (no version
 upgrades, SDK migrations, framework migrations, Graviton/ARM migrations, custom transformation
@@ -146,8 +157,8 @@ a workaround.
 # Orchestration Protocol
 
 1. For each repository in the engagement, call codebase_analysis_agent,
-   modernization_readiness_agent, and business_rules_agent.
-2. Once all 3 have returned success for a repository, call generate_assessment_report, passing
+   modernization_readiness_agent, business_rules_agent, and security_compliance_agent.
+2. Once all 4 have returned success for a repository, call generate_assessment_report, passing
    along each tool's output_dir and any client/industry/compliance context from the original
    request, to produce the due-diligence DOCX. Report the returned groundedness summary to the
    user - if any citations are unverified, explicitly flag the report as needing human review
@@ -186,7 +197,8 @@ def create_orchestrator(session_id: str = None, actor_id: str = None) -> Agent:
         system_prompt=ORCHESTRATOR_PROMPT,
         tools=[
             codebase_analysis_agent, modernization_readiness_agent, business_rules_agent,
-            generate_assessment_report, list_output_files, read_output_file,
+            security_compliance_agent, generate_assessment_report, list_output_files,
+            read_output_file,
         ],
         hooks=hooks,
         state={"actor_id": actor_id, "session_id": session_id}

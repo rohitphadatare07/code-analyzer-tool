@@ -8,7 +8,7 @@ in `CLAUDE.md` at the repo root.
 
 ## Architecture
 
-The orchestrator is a Strands `Agent` with 6 tools, all agents-as-tools style (each takes a
+The orchestrator is a Strands `Agent` with 7 tools, all agents-as-tools style (each takes a
 single free-text `query` string — see "Why one string arg?" below):
 
 ```
@@ -16,18 +16,22 @@ Orchestrator (agent.py)
 ├── codebase_analysis_agent          → AWS/comprehensive-codebase-analysis (1 repo)
 ├── modernization_readiness_agent    → AWS/modernization-readiness-analysis (1 repo)
 ├── business_rules_agent             → AWS/business-rules-extraction (1 repo)
-├── generate_assessment_report       → synthesizes all 3 into the due-diligence DOCX
+├── security_compliance_agent        → native osv-scanner + detect-secrets scan (1 repo, no TD)
+├── generate_assessment_report       → synthesizes all 4 into the due-diligence DOCX
 ├── list_output_files                → list a completed analysis's output files
 └── read_output_file                 → read a specific output file's contents
 ```
 
-**No AWS Batch.** Each analysis tool runs synchronously: it `git clone`s the target repo to
-local disk, then runs `atx custom def exec -n <TD> -p <repo> -x -t` as a subprocess on
-whatever host `agent.py` itself is running on, and returns the result directly — there's no
-async job queue or status-polling step. See `tools/assessmenttransform.py`.
+**No AWS Batch.** Each of the 3 TD-backed analysis tools runs synchronously: it `git clone`s
+the target repo to local disk, then runs `atx custom def exec -n <TD> -p <repo> -x -t` as a
+subprocess on whatever host `agent.py` itself is running on, and returns the result directly
+— there's no async job queue or status-polling step. See `tools/assessmenttransform.py`.
+`security_compliance_agent` (`tools/security_analysis.py`) follows the same clone-then-scan
+shape, but has no TD to invoke — no scanning TD exists for this — so it shells out directly
+to `osv-scanner` (dependency/CVE) and `detect-secrets` (secrets detection) against the clone.
 
 `generate_assessment_report` (`tools/synthesis.py`) runs as **two separate agent calls**:
-1. A codebase-grounded call (report sections 1/2/4) given **zero tools** — structurally
+1. A codebase-grounded call (report sections 1/2/3/4) given **zero tools** — structurally
    incapable of citing anything but the analysis findings it's handed.
 2. A strategy call (sections 5-10 + executive summary) given the official **AWS
    Documentation MCP server**'s tools (`search_documentation`, `read_documentation`,
@@ -38,12 +42,14 @@ Every factual sentence inside a section's narrative text must carry an inline ci
 (`[[finding:...]]` / `[[doc:...]]`) — never inside a table cell, chart value, or diagram
 node/edge — which `tools/grounding.py` verifies mechanically against that call's actual
 tool-call trace before the report is rendered. `build_docx.py` strips the tags for display
-and lists cited AWS doc URLs as a "Sources" appendix. Report section 3 (Security &
-Compliance) has no v1 data source and always renders as an explicit "not covered"
-placeholder — never fabricated. Section 5 (Recommended To-Be Architecture) is **always**
-synthesized by the strategy call regardless of whether the engagement covers one repository
-or many — it is no longer gated behind the removed cross-repo portfolio TD; for multiple
-repositories the strategy call produces one consolidated architecture spanning all of them.
+and lists cited AWS doc URLs as a "Sources" appendix. Every section is now a real synthesized
+section — section 3 (Security & Compliance) is fed by `security_compliance_agent`'s scan
+output (methodology adapted from the [OWASP Secure Agent Playbook](https://github.com/OWASP/secure-agent-playbook),
+CC-BY-4.0 — see `tools/security_analysis.py`'s module docstring for exactly what was reused
+vs. reimplemented), and section 5 (Recommended To-Be Architecture) is **always** synthesized
+regardless of whether the engagement covers one repository or many — it is no longer gated
+behind the removed cross-repo portfolio TD; for multiple repositories the strategy call
+produces one consolidated architecture spanning all of them.
 
 Every analysis TD is instructed to emit any diagram it produces as a fenced ```mermaid```
 code block — `assessmenttransform.py`'s `MERMAID_DIAGRAM_INSTRUCTION` is appended to all 3
@@ -77,7 +83,8 @@ new tools consistent with this pattern.
 | File | Purpose |
 |------|---------|
 | `agent.py` | Orchestrator: system prompt, tool wiring, AgentCore entrypoint |
-| `tools/assessmenttransform.py` | The 3 per-repo analysis tools + `list_output_files`/`read_output_file` |
+| `tools/assessmenttransform.py` | The 3 TD-backed per-repo analysis tools + `list_output_files`/`read_output_file` |
+| `tools/security_analysis.py` | `security_compliance_agent` — native osv-scanner/detect-secrets scan, no TD |
 | `tools/synthesis.py` | `generate_assessment_report` — the two-call synthesis described above |
 | `tools/build_docx.py` | Pure DOCX rendering (no AWS calls) — Executive Summary + 10 sections (each with subsections/tables/charts/diagrams) + Sources appendix |
 | `tools/visuals.py` | Pure chart (matplotlib) and diagram (Graphviz) rendering to PNG — every function degrades to `None` on failure instead of raising |
@@ -104,15 +111,35 @@ Whatever host actually runs `agent.py` (local machine, EC2, or the container bui
   `dot -V` is on PATH. The `graphviz` pip package (in `requirements.txt`) only wraps this
   binary, it doesn't bundle it. If `dot` isn't found, that one diagram is skipped with a
   logged warning rather than failing the whole report (`tools/visuals.py`).
+- **`osv-scanner` binary** — required for section 3's dependency/CVE scan
+  (`security_compliance_agent`). A single static Go binary from the
+  [google/osv-scanner](https://github.com/google/osv-scanner) project — download a release
+  binary and put it on `PATH`. Not pip-installable. If missing, the dependency/CVE scan is
+  skipped with a warning, not a failure (`tools/security_analysis.py`).
+- **`detect-secrets`** — required for section 3's secrets scan. Installed via
+  `requirements.txt` (pip), which also creates the `detect-secrets` console script this tool
+  shells out to — no separate binary download needed, unlike the two above. If missing (or
+  the scan otherwise fails), falls back to a small set of regex patterns automatically.
+  **Note**: this integration's file/directory-scan behavior (`detect-secrets scan
+  --all-files <path>`) was not successfully reproduced end-to-end in a Windows sandbox test
+  during development — the detector logic itself was confirmed working (`detect-secrets scan
+  --string "..."` correctly flags known patterns), but the file-scanning path returned no
+  results even for an unambiguous private-key header, for reasons not fully root-caused
+  (`detect-secrets` is primarily built/tested for Linux CI environments, which is what this
+  orchestrator actually runs on — plausibly a Windows-specific quirk, not a real bug, but
+  unconfirmed). **Verify this actually detects secrets on the real Linux deployment target
+  before trusting it.**
 - **AWS credentials** with at least `bedrock:InvokeModel` (env vars, `~/.aws/credentials`,
   or an instance role).
 
 > **Known gap:** `Dockerfile` in this directory currently installs only the Python
-> dependencies — it does **not** install `git`, the `atx` CLI, or Graphviz's `dot` binary. A
-> container built from it as-is can hold a conversation but will fail with `FileNotFoundError`
-> on any actual repo analysis, and will silently skip both architecture diagrams. Fix this
-> before relying on the Docker path (see `scaled-execution-containers/container/Dockerfile`
-> for the `atx` install command to copy over; Graphviz is a standard apt/distro package).
+> dependencies — it does **not** install `git`, the `atx` CLI, Graphviz's `dot` binary, or
+> `osv-scanner`. A container built from it as-is can hold a conversation but will fail with
+> `FileNotFoundError` on any actual repo analysis, and will silently skip both architecture
+> diagrams and the dependency/CVE scan. Fix this before relying on the Docker path (see
+> `scaled-execution-containers/container/Dockerfile` for the `atx` install command to copy
+> over; Graphviz and `osv-scanner` are a standard apt/distro package and a downloadable
+> release binary, respectively).
 
 ## Local Development
 
@@ -139,13 +166,13 @@ contract: `POST /invocations`, `GET /ping` — confirmed from the installed SDK'
 curl -X POST http://localhost:8080/invocations \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "Run the full assessment on https://github.com/someorg/somerepo. Client: Acme Corp, industry: healthcare, compliance: HIPAA. Once all three analyses succeed, generate the due-diligence report."
+    "prompt": "Run the full assessment on https://github.com/someorg/somerepo. Client: Acme Corp, industry: healthcare, compliance: HIPAA. Once all four analyses succeed, generate the due-diligence report."
   }'
 ```
 
 There's no structured "repo" field — every tool's `query` is free text, and the model
 extracts the repo URL / client name / context itself. The orchestrator's own prompt tells it
-to run all 3 analyses per repo, then call `generate_assessment_report` once they succeed.
+to run all 4 analyses per repo, then call `generate_assessment_report` once they succeed.
 
 ## Deploy (Bedrock AgentCore Runtime)
 
