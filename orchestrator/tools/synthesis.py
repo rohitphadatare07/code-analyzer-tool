@@ -78,7 +78,15 @@ from .grounding import extract_tool_trace, verify_citations, strip_citations, st
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-MAX_FINDINGS_CHARS = 40000  # per-repo cap fed into the synthesis prompt
+MAX_FINDINGS_CHARS = 150000  # per-repo, per-TD cap fed into the synthesis prompt.
+# Bumped from 40000: Business Rules Extraction's confirmed real output spans 15-20+
+# distinct files across multiple domain-*/ folders (Section 2's 9-subsection design
+# sources from bounded-contexts.md, execution-order.md, N x business-rules.md,
+# N x workflows.md, N x validations.md, cross-domain/data/API/traceability docs). The
+# old 40K cap risked truncating away later files (e.g. traceability-matrix.md) before
+# the LLM ever saw them - _read_findings truncates the tail of the concatenation, not
+# per-file, so a low cap silently drops whole files rather than shrinking all of them.
+# 150K chars is still well within Claude's context window per findings source.
 
 FINDING_LABELS = {
     "Comprehensive Codebase Analysis",
@@ -138,7 +146,9 @@ Each entry in "sections" is a JSON OBJECT, not a plain string:
 }
 
 - "subsections" is REQUIRED, at least 1 entry, ideally 3-5 focused subsections
-  instead of one giant one.
+  instead of one giant one - UNLESS a section's own guidance below specifies an exact
+  required list of subsections (e.g. section 2's 9 fixed subsections), in which case
+  follow that exact list instead of this general 3-5 guideline.
 - A subsection's "table" key is OPTIONAL - include it only when that specific
   subsection's findings are genuinely tabular. Omit the key entirely otherwise.
 - The section-level "tables", "chart", and "diagram" keys are OPTIONAL and only
@@ -199,12 +209,66 @@ Section 1 - Current Architecture of the Codebase:
     distinct components clearly enough to draw - this should be rare.
 
 Section 2 - Business Logic & Domain Understanding:
-  - Subsections should cover: key business rules, data model, workflows.
-  - Section-level "tables" (a list, 0-2 entries):
-    - {"title": "Business Rules Register", "headers": ["ID", "Rule", "Domain"], "rows": [...]}
-      if the Business Rules Extraction findings give a numbered rules list.
-    - {"title": "Core Data Model", "headers": ["Entity", "Key Attributes", "Relationships"],
-       "rows": [...]} if the findings describe concrete entities.
+  - The Business Rules Extraction findings are organized into a KNOWN file/folder structure
+    (confirmed against real output) - each file's content in the findings text is preceded by
+    a "--- <relative path> ---" header (see _read_findings). Use those paths to locate the
+    right source for each subsection below rather than searching the whole blob blindly.
+    "domain-*" means one folder per domain (domain-1/, domain-2/, ...) - aggregate content
+    across ALL domain-* folders into ONE consolidated table per subsection (with a "Domain"
+    column identifying which domain each row came from), not one table per domain.
+  - This section is REQUIRED to have exactly these 9 subsections, in this order (only omit
+    one specific subsection's table if its named source file(s) are genuinely absent from
+    the findings - never omit the subsection's narrative or renumber the others):
+
+    2.1 Domain Decomposition & Bounded Contexts
+        Source: bounded-contexts.md + domain-decomposition-overview/README.md
+        Narrative: bounded context boundaries and the rationale behind them.
+        Table: {"headers": ["Domain", "Complexity", "LOC", "Files", "Features", "Rules Count"], "rows": [...]}
+
+    2.2 Domain Dependency Graph & Execution Order
+        Source: execution-order.md + domain-manifest.json (its "depends_on" fields)
+        Narrative: how domains depend on each other and communicate.
+        Table: {"headers": ["Phase", "Domain(s)", "Depends On"], "rows": [...]}
+
+    2.3 Business Rules Catalog
+        Source: detailed-domain-bre/domain-*/business-rules.md
+        Narrative: brief framing of the rules catalog's scope.
+        Table: {"headers": ["Rule ID", "Domain", "Rule Description", "Source (File:Line)", "Testable Assertion", "Enforcement Type"], "rows": [...]}
+
+    2.4 Core Workflows & Process Flows
+        Source: detailed-domain-bre/domain-*/workflows.md
+        Narrative: how the core workflows fit together.
+        Table: {"headers": ["Workflow ID", "Domain", "Step Sequence Summary", "Parallel/Sequential", "Dependencies"], "rows": [...]}
+
+    2.5 Validation & Constraint Rules
+        Source: detailed-domain-bre/domain-*/validations.md + requirements-summary.md (NFRs)
+        Narrative: notable validation/constraint patterns (schema enforcement, thresholds).
+        Table: {"headers": ["Rule", "Type", "Constraint Value", "Source"], "rows": [...]}
+
+    2.6 Cross-Domain Features & Shared Logic
+        Source: cross-domain-features.md + shared-kernel.md + cross-cutting-documentation/*.md
+        Narrative: features/logic spanning multiple domains.
+        Table: {"headers": ["Feature", "Domains Involved", "Shared Component"], "rows": [...]}
+
+    2.7 Data Model & Ownership
+        Source: data-ownership.md + database-documentation/ + class-er-diagrams.md
+        Narrative: persistence model (DB/memory/session) and data lifecycle.
+        Table: {"headers": ["Entity", "Owning Domain", "Persistence", "Lifecycle"], "rows": [...]}
+
+    2.8 API Contracts & Integration Points
+        Source: api-endpoint-catalog.md + external-integrations-map.md + service-component-inventory.md
+        Narrative: notable external integrations (auth model, SDK/version constraints).
+        Table: {"headers": ["Endpoint/Service", "Direction", "Request/Response Summary", "Auth/SDK Notes"], "rows": [...]}
+
+    2.9 Traceability Matrix
+        Source: traceability-matrix.md + requirements-summary.md
+        Narrative: overall FR/NFR coverage picture.
+        Table: {"headers": ["Rule/Requirement", "Feature", "Source (File:Line)", "FR/NFR Coverage"], "rows": [...]}
+
+  - Each subsection's table goes in THAT subsection's own "table" key (not a section-level
+    "tables" list) - each of the 9 has genuinely different columns, so keep them separate.
+  - No diagrams in this section (section 1/5 own the architecture diagrams) - represent
+    2.1's "context map" and 2.2's "dependency graph" as the tables above, not as images.
 
 Section 3 - Security & Compliance Findings:
   - The "Security & Compliance Analysis" findings source is native scanner output (a JSON
@@ -228,25 +292,52 @@ Section 3 - Security & Compliance Findings:
     completely absent from what you were given.
 
 Section 4 - Modernization Readiness:
-  - Subsections should cover: cloud-native maturity assessment, specific anti-patterns
-    blocking cloud adoption.
-  - Section-level "chart": IMPORTANT - the Modernization Readiness Analysis findings
-    (look for a file literally named report.json in that source's findings block) often
-    already contain a structured per-dimension maturity/gap score. If so, reuse those
-    EXACT dimension names, scores, and scale verbatim - do not recompute or re-derive
-    your own numbers. Shape:
-      "chart": {"type": "scorecard_bar", "title": "Modernization Readiness Scorecard",
-                 "scale_max": 5,
-                 "dimensions": [{"name": "Operational Excellence", "score": 2},
-                                 {"name": "Security", "score": 3}]}
-    "scale_max" must match whatever scale report.json actually uses (commonly 0-5; use
-    whatever the source data uses, do not assume). If report.json (or equivalent
-    structured scoring) isn't present in the findings, OMIT "chart" entirely rather
-    than inventing scores.
-  - Section-level "tables": a single entry,
-      {"title": "Anti-Patterns Blocking Cloud Adoption",
-       "headers": ["Anti-Pattern", "Component", "Why It Blocks Modernization"], "rows": [...]}
-    Omit if the findings don't name specific anti-patterns/components."""
+  - The Modernization Readiness Analysis findings follow a KNOWN, confirmed output contract:
+    a four-artifact bundle at modernization-readiness-analysis/{repo-name}-mod-report.{md,json,html,metadata.json}.
+    The JSON artifact (find the "--- <path> ---" chunk ending in "-mod-report.json") is the
+    CANONICAL source - it contains a "categories" object with, for each of 5 categories,
+    a numeric_score / score_rating / severity_status; an "overall_score"; a "top_gaps" list;
+    "pathways" (7 entries, one per AWS Modernization Pathway); and, when applicable, a
+    "decomposition_strategy" object. Prefer reading these exact fields over parsing prose out
+    of the .md report.
+  - IMPORTANT - the scoring scale is 1-4, NOT 0-5 or 0-100: 4=Mature, 3=Partial,
+    2=Needs Work, 1=Not Ready. Never assume a different scale.
+  - This section is REQUIRED to have exactly these subsections, in this order (only omit
+    4.4 if the findings don't show a triggered decomposition need - never omit 4.1-4.3):
+
+    4.1 Score Summary
+        Source: the JSON artifact's "categories" (5 entries) and "overall_score".
+        Narrative: what the overall score and category spread indicate about readiness.
+        Table: {"headers": ["Category", "Score", "Rating"], "rows": [...]} - use the 5 real
+          category names (Infrastructure/Platform/DevOps, Application Architecture, Data
+          Platform Modernization, Security Baseline, Operations & Observability) and their
+          EXACT numeric_score/score_rating verbatim from the JSON, plus an "Overall" row.
+        Section-level "chart": reuse the same 5 categories/scores verbatim -
+          {"type": "scorecard_bar", "title": "Modernization Readiness Scorecard", "scale_max": 4,
+           "dimensions": [{"name": "Infrastructure, Platform, and DevOps", "score": 2}, ...]}
+          OMIT "chart" entirely (do not invent scores) if the JSON artifact's category scores
+          aren't present in the findings.
+
+    4.2 Top 5 Gaps
+        Source: the JSON artifact's "top_gaps" list (already computed - don't re-derive it).
+        Narrative: brief framing of what the gaps have in common, if anything.
+        Table: {"headers": ["Question", "Score", "Gap Summary", "Impact"], "rows": [...]}
+
+    4.3 Cloud-Native Maturity & Anti-Patterns
+        Narrative: synthesis of maturity level and specific anti-patterns blocking adoption,
+          citing specific findings (not just category scores).
+        Table (optional): {"headers": ["Anti-Pattern", "Component", "Why It Blocks Modernization"], "rows": [...]}
+          Omit if the findings don't name specific anti-patterns/components.
+
+    4.4 Decomposition Strategy (CONDITIONAL - only if the JSON artifact includes a
+        "decomposition_strategy" object, which only appears when the monolith-vs-microservices
+        question scored low; omit this subsection entirely otherwise, do not fabricate one)
+        Source: the JSON artifact's "decomposition_strategy" object.
+        Narrative: which approach is recommended and why.
+        Table: {"headers": ["Approach", "Description", "Level of Effort", "Recommendation"],
+                "rows": [...]} - reuse the TD's own approach options (Strengthen as Modular
+          Monolith / Strangler Fig / Conditional-Adaptive / Big-Bang Rewrite) verbatim, not
+          invented alternatives."""
 
 _CODEBASE_WORKED_EXAMPLE = """
 
@@ -274,15 +365,42 @@ shape (worked example - illustrative content only, replace with what the finding
     },
     "2": {
       "subsections": [
-        {"heading": "Key Business Rules", "narrative": "Order totals must apply a loyalty discount before tax. [[finding:Business Rules Extraction]]"},
-        {"heading": "Data Model", "narrative": "The domain centers on Order, Customer, and Product entities. [[finding:Business Rules Extraction]]"},
-        {"heading": "Workflows", "narrative": "Checkout is a 4-step synchronous workflow with no async/queue-based steps today. [[finding:Business Rules Extraction]]"}
-      ],
-      "tables": [
-        {"title": "Business Rules Register", "headers": ["ID", "Rule", "Domain"],
-         "rows": [["BR-01", "Loyalty discount applies before tax", "Pricing"], ["BR-02", "Orders over $500 require manager approval", "Order Management"]]},
-        {"title": "Core Data Model", "headers": ["Entity", "Key Attributes", "Relationships"],
-         "rows": [["Order", "id, status, total", "belongs to Customer, has many OrderLines"], ["Customer", "id, loyalty_tier", "has many Orders"]]}
+        {"heading": "2.1 Domain Decomposition & Bounded Contexts",
+         "narrative": "The system decomposes into three bounded contexts - Ordering, Catalog, and Customer - each with clear ownership boundaries. [[finding:Business Rules Extraction]]",
+         "table": {"headers": ["Domain", "Complexity", "LOC", "Files", "Features", "Rules Count"],
+                    "rows": [["Ordering", "High", "4200", "38", "12", "27"], ["Catalog", "Medium", "1800", "15", "6", "9"]]}},
+        {"heading": "2.2 Domain Dependency Graph & Execution Order",
+         "narrative": "Ordering depends on both Catalog and Customer; Catalog and Customer have no interdependencies and can be analyzed in parallel. [[finding:Business Rules Extraction]]",
+         "table": {"headers": ["Phase", "Domain(s)", "Depends On"],
+                    "rows": [["1", "Catalog, Customer", "None"], ["2", "Ordering", "Catalog, Customer"]]}},
+        {"heading": "2.3 Business Rules Catalog",
+         "narrative": "27 business rules were extracted from the Ordering domain alone, the highest concentration of any domain. [[finding:Business Rules Extraction]]",
+         "table": {"headers": ["Rule ID", "Domain", "Rule Description", "Source (File:Line)", "Testable Assertion", "Enforcement Type"],
+                    "rows": [["BR-01", "Ordering", "Loyalty discount applies before tax", "OrderService.java:142", "discount applied pre-tax", "code"], ["BR-02", "Ordering", "Orders over $500 require manager approval", "OrderService.java:210", "approval_required if total > 500", "code"]]}},
+        {"heading": "2.4 Core Workflows & Process Flows",
+         "narrative": "Checkout is a 4-step synchronous workflow with no async/queue-based steps today. [[finding:Business Rules Extraction]]",
+         "table": {"headers": ["Workflow ID", "Domain", "Step Sequence Summary", "Parallel/Sequential", "Dependencies"],
+                    "rows": [["WF-01", "Ordering", "Cart -> Validate -> Charge -> Confirm", "Sequential", "Catalog (pricing), Customer (loyalty tier)"]]}},
+        {"heading": "2.5 Validation & Constraint Rules",
+         "narrative": "Order attachments are capped at 10MB, enforced at the API layer rather than in the domain model. [[finding:Business Rules Extraction]]",
+         "table": {"headers": ["Rule", "Type", "Constraint Value", "Source"],
+                    "rows": [["Attachment size limit", "Threshold", "10MB", "requirements-summary.md"]]}},
+        {"heading": "2.6 Cross-Domain Features & Shared Logic",
+         "narrative": "Loyalty tier lookups are shared between Ordering and Customer via a common kernel module. [[finding:Business Rules Extraction]]",
+         "table": {"headers": ["Feature", "Domains Involved", "Shared Component"],
+                    "rows": [["Loyalty pricing", "Ordering, Customer", "LoyaltyKernel"]]}},
+        {"heading": "2.7 Data Model & Ownership",
+         "narrative": "Order and Customer are persisted in the primary relational database; cart state lives only in session memory. [[finding:Business Rules Extraction]]",
+         "table": {"headers": ["Entity", "Owning Domain", "Persistence", "Lifecycle"],
+                    "rows": [["Order", "Ordering", "Database", "Retained indefinitely"], ["Cart", "Ordering", "Session memory", "Expires on checkout or timeout"]]}},
+        {"heading": "2.8 API Contracts & Integration Points",
+         "narrative": "The Ordering service calls a third-party payment gateway synchronously during checkout. [[finding:Business Rules Extraction]]",
+         "table": {"headers": ["Endpoint/Service", "Direction", "Request/Response Summary", "Auth/SDK Notes"],
+                    "rows": [["POST /checkout", "Inbound", "Cart -> confirmation payload", "Session-based auth"], ["Payment Gateway API", "Outbound", "Charge request -> approval/decline", "API key, vendor SDK v3"]]}},
+        {"heading": "2.9 Traceability Matrix",
+         "narrative": "All 27 Ordering-domain rules trace back to a specific source file and line; no orphaned requirements were found. [[finding:Business Rules Extraction]]",
+         "table": {"headers": ["Rule/Requirement", "Feature", "Source (File:Line)", "FR/NFR Coverage"],
+                    "rows": [["BR-01", "Checkout pricing", "OrderService.java:142", "FR"], ["Attachment size limit", "Order attachments", "requirements-summary.md", "NFR"]]}}
       ]
     },
     "3": {
@@ -297,15 +415,25 @@ shape (worked example - illustrative content only, replace with what the finding
     },
     "4": {
       "subsections": [
-        {"heading": "Cloud-Native Maturity", "narrative": "The application has no containerization and stores session state in-process, blocking horizontal scaling. [[finding:Modernization Readiness Analysis]]"},
-        {"heading": "Anti-Patterns Blocking Cloud Adoption", "narrative": "In-process session state and a filesystem-based upload directory are the two most significant blockers found. [[finding:Modernization Readiness Analysis]]"}
+        {"heading": "4.1 Score Summary",
+         "narrative": "The overall score of 2.2/4.0 reflects broad gaps concentrated in Infrastructure and Security, while Application Architecture is comparatively mature. [[finding:Modernization Readiness Analysis]]",
+         "table": {"headers": ["Category", "Score", "Rating"],
+                    "rows": [["Infrastructure, Platform, and DevOps", "2 / 4.0", "Needs Work"], ["Application Architecture", "3 / 4.0", "Partial"], ["Data Platform Modernization", "2 / 4.0", "Needs Work"], ["Security Baseline", "2 / 4.0", "Needs Work"], ["Operations & Observability", "2 / 4.0", "Needs Work"], ["Overall", "2.2 / 4.0", "Needs Work"]]}},
+        {"heading": "4.2 Top 5 Gaps",
+         "narrative": "The lowest-scoring questions cluster around self-managed compute and database infrastructure. [[finding:Modernization Readiness Analysis]]",
+         "table": {"headers": ["Question", "Score", "Gap Summary", "Impact"],
+                    "rows": [["INF-Q1: Managed Compute", "1", "Compute runs on unmanaged EC2 instances", "Manual patching and scaling burden"], ["INF-Q2: Managed Databases", "1", "Self-managed MySQL on EC2", "Manual backup/HA, no managed failover"]]}},
+        {"heading": "4.3 Cloud-Native Maturity & Anti-Patterns",
+         "narrative": "The application has no containerization and stores session state in-process, blocking horizontal scaling. [[finding:Modernization Readiness Analysis]]",
+         "table": {"headers": ["Anti-Pattern", "Component", "Why It Blocks Modernization"],
+                    "rows": [["In-process session state", "Web tier", "Prevents horizontal auto-scaling"], ["Local filesystem file uploads", "Order attachments", "Not portable to stateless/ephemeral compute"]]}},
+        {"heading": "4.4 Decomposition Strategy",
+         "narrative": "Strangler Fig is recommended given identifiable module boundaries and organizational capacity for incremental extraction. [[finding:Modernization Readiness Analysis]]",
+         "table": {"headers": ["Approach", "Description", "Level of Effort", "Recommendation"],
+                    "rows": [["Strangler Fig (Parallel Track)", "Incrementally extract services while the monolith keeps running", "Medium to High", "Recommended"], ["Big-Bang Rewrite", "Full rewrite, single cutover", "Very High", "Recommended against"]]}}
       ],
-      "chart": {"type": "scorecard_bar", "title": "Modernization Readiness Scorecard", "scale_max": 5,
-                "dimensions": [{"name": "Operational Excellence", "score": 2}, {"name": "Security", "score": 2}, {"name": "Reliability", "score": 3}, {"name": "Performance Efficiency", "score": 2}, {"name": "Cost Optimization", "score": 1}]},
-      "tables": [
-        {"title": "Anti-Patterns Blocking Cloud Adoption", "headers": ["Anti-Pattern", "Component", "Why It Blocks Modernization"],
-         "rows": [["In-process session state", "Web tier", "Prevents horizontal auto-scaling"], ["Local filesystem file uploads", "Order attachments", "Not portable to stateless/ephemeral compute"]]}
-      ]
+      "chart": {"type": "scorecard_bar", "title": "Modernization Readiness Scorecard", "scale_max": 4,
+                "dimensions": [{"name": "Infrastructure, Platform, and DevOps", "score": 2}, {"name": "Application Architecture", "score": 3}, {"name": "Data Platform Modernization", "score": 2}, {"name": "Security Baseline", "score": 2}, {"name": "Operations & Observability", "score": 2}]}
     }
   }
 }
@@ -360,13 +488,37 @@ Section 5 - Recommended To-Be Architecture:
     findings to build from - this should be rare.
 
 Section 6 - Recommended AWS Service Usage:
-  - Subsections grouped by concern (e.g. Compute & Application Hosting, Data & Storage,
-    Networking & Delivery), each citing the SPECIFIC AWS service recommended per
-    component/pattern found in the findings.
-  - Section-level "tables": a single entry,
-      {"title": "Component to AWS Service Mapping",
+  - Structure this section around the Modernization Readiness Analysis findings' 7 named AWS
+    Modernization Pathways (Move to Cloud Native, Move to Containers, Move to Open Source,
+    Move to Managed Databases, Move to Managed Analytics, Move to Modern DevOps, Move to AI) -
+    the findings' JSON artifact already evaluates and scores each one with a status
+    (Triggered / Not Triggered / Not Applicable), a priority, an estimated effort, and (for
+    Triggered pathways) a list of representative AWS services. Reuse this structure rather
+    than inventing a different "group by concern" grouping.
+  - Section-level "tables": a single entry, the Pathway Summary reused verbatim from the
+    findings:
+      {"title": "AWS Modernization Pathways", "headers": ["Pathway", "Status", "Priority", "Est. Effort"],
+       "rows": [...]}
+    Include all 7 pathways in this table regardless of status (matches the source TD's own
+    convention of always showing all 7).
+  - Subsections: create ONE subsection per pathway with status "Triggered" ONLY - do NOT
+    create a subsection for a Not Triggered or Not Applicable pathway (matches the source
+    TD's own convention: it only details triggered pathways). Each triggered pathway's
+    subsection should:
+    - Narrative: current-state gap that triggered it, cite the specific AWS services the
+      findings recommend for it (verbatim - do not substitute your own service picks), and
+      the recommended migration pattern/tooling if the findings name one (e.g. Strangler Fig,
+      AWS DMS/SCT).
+    - Optional "table": {"headers": ["Recommended AWS Service", "Role"], "rows": [...]} if the
+      findings list enough distinct services for that pathway to warrant one.
+  - If NO pathways are Triggered, include a single subsection stating that plainly (with the
+    Pathway Summary table still shown) rather than fabricating a triggered pathway.
+  - Also produce a component-to-service mapping table if the codebase-facing sections named
+    specific components that map cleanly to a recommended service (e.g. from a pathway's
+    detail): {"title": "Component to AWS Service Mapping",
        "headers": ["Current Component", "Recommended AWS Service", "Rationale"], "rows": [...]}
-    (The target-architecture diagram itself belongs to section 5, not here - don't duplicate
+    Omit if this would just duplicate the Pathway Summary table without adding new information.
+  - (The target-architecture diagram itself belongs to section 5, not here - don't duplicate
     a "diagram" key in section 6.)
 
 Section 7 - Migration Roadmap:
@@ -427,15 +579,18 @@ actually say):
     },
     "6": {
       "subsections": [
-        {"heading": "Compute & Application Hosting", "narrative": "The Java/Spring monolith is a strong fit for containerization onto Amazon ECS on Fargate, removing the operational burden of patching EC2 hosts. [[doc:https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html]]"},
-        {"heading": "Data & Storage", "narrative": "MySQL 5.6 should move to Amazon Aurora MySQL-Compatible Edition, which supports in-place logical replication from self-managed MySQL. [[doc:https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraMySQL.Migrating.html]]"}
+        {"heading": "Move to Containers",
+         "narrative": "Compute currently runs on unmanaged EC2 instances with no container definitions found, triggering this pathway. Containerizing onto Amazon ECS on Fargate removes the operational burden of patching EC2 hosts. [[finding:Modernization Readiness Analysis]] [[doc:https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html]]",
+         "table": {"headers": ["Recommended AWS Service", "Role"],
+                    "rows": [["Amazon ECS on Fargate", "Container orchestration, no host management"], ["Amazon ECR", "Container image registry"]]}},
+        {"heading": "Move to Managed Databases",
+         "narrative": "MySQL is self-managed on EC2 with no managed failover, triggering this pathway. Amazon Aurora MySQL-Compatible Edition supports in-place logical replication from self-managed MySQL. [[finding:Modernization Readiness Analysis]] [[doc:https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraMySQL.Migrating.html]]",
+         "table": {"headers": ["Recommended AWS Service", "Role"],
+                    "rows": [["Amazon Aurora MySQL-Compatible Edition", "Managed, EOL-free relational database"], ["AWS DMS", "Migration tooling for near-zero-downtime cutover"]]}}
       ],
       "tables": [
-        {"title": "Component to AWS Service Mapping",
-         "headers": ["Current Component", "Recommended AWS Service", "Rationale"],
-         "rows": [["Apache HTTP Server", "Amazon CloudFront + Application Load Balancer", "Managed edge/load-balancing, removes patching burden"],
-                   ["Java/Spring Monolith (Tomcat)", "Amazon ECS on Fargate", "Containerize without managing EC2 hosts"],
-                   ["MySQL 5.6", "Amazon Aurora MySQL-Compatible Edition", "Managed, EOL-free, supports near-zero-downtime migration"]]}
+        {"title": "AWS Modernization Pathways", "headers": ["Pathway", "Status", "Priority", "Est. Effort"],
+         "rows": [["Move to Cloud Native", "Not Triggered", "-", "-"], ["Move to Containers", "Triggered", "Medium", "Medium"], ["Move to Open Source", "Not Applicable", "-", "-"], ["Move to Managed Databases", "Triggered", "High", "Medium"], ["Move to Managed Analytics", "Not Triggered", "-", "-"], ["Move to Modern DevOps", "Not Triggered", "-", "-"], ["Move to AI", "Not Triggered", "-", "-"]]}
       ]
     },
     "7": {
@@ -524,10 +679,10 @@ def _parse_json_response(raw_text: str) -> Dict[str, Any]:
     return json.loads(raw_text)
 
 
-def _make_bedrock_model() -> BedrockModel:
+def _make_bedrock_model(max_tokens: int = 8192) -> BedrockModel:
     region = os.getenv("AWS_REGION", "us-east-1")
     model_id = os.getenv("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
-    return BedrockModel(model_id=model_id, region_name=region, temperature=0.3, max_tokens=8192)
+    return BedrockModel(model_id=model_id, region_name=region, temperature=0.3, max_tokens=max_tokens)
 
 
 def _normalize_table(table: Any):
@@ -602,7 +757,10 @@ def _synthesize_sections(findings_by_repo: Dict[str, Dict[str, str]], context: s
             findings_text += f"\n[{label}]\n{text or '(no output captured)'}\n"
 
     # --- Call 1: codebase-grounded sections, structurally NO tools ---
-    codebase_agent = Agent(model=_make_bedrock_model(), system_prompt=CODEBASE_SECTIONS_PROMPT, tools=[])
+    # Section 2's 9-subsection design (each with its own table) makes this call's JSON
+    # output substantially larger than the strategy call's - give it more room so a long
+    # response doesn't get cut off mid-JSON (which would fail _parse_json_response outright).
+    codebase_agent = Agent(model=_make_bedrock_model(max_tokens=16000), system_prompt=CODEBASE_SECTIONS_PROMPT, tools=[])
     codebase_result = codebase_agent(f"Findings:{findings_text}")
     codebase_text = _extract_agent_text(codebase_result)
     codebase_json = _parse_json_response(codebase_text)
