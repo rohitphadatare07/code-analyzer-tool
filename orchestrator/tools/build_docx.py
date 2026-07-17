@@ -19,6 +19,12 @@ Chart/diagram PNGs are rendered on demand (tools/visuals.py) to
 "<output_path stem>_images/" (sibling to the .docx); a section whose data is
 missing or fails to render (e.g. Graphviz's `dot` binary isn't installed)
 simply has no image for that slot - visuals.py's renderers never raise.
+
+Report-level appendices (top-level keys, not nested in "sections") render after
+all 10 numbered sections, in this order: Learning Materials, Evidence Index,
+Sources. "learning_materials"/"evidence_index" are optional {"headers": [...],
+"rows": [...]} tables sourced from the Modernization Readiness Analysis
+findings (tools/synthesis.py) - omitted entirely when absent, never fabricated.
 """
 
 import os
@@ -34,7 +40,7 @@ logger.setLevel(logging.INFO)
 
 SECTION_TITLES = [
     "Current Architecture of the Codebase",
-    "Business Logic & Domain Understanding",
+    "Implemented Business Rule Extraction",
     "Security & Compliance Findings",
     "Modernization Readiness",
     "Recommended To-Be Architecture",
@@ -186,6 +192,22 @@ def build_docx(report_content: dict, output_path: str) -> str:
         chart_path = _render_section_visual("chart", section.get("chart"), images_dir, i)
         if chart_path:
             _add_image(doc, chart_path)
+
+    learning_materials = report_content.get('learning_materials')
+    if isinstance(learning_materials, dict) and learning_materials.get('headers') and learning_materials.get('rows'):
+        doc.add_heading('Learning Materials', level=1)
+        doc.add_paragraph(
+            'AWS learning resources for the modernization pathways identified in this engagement:'
+        )
+        _add_table(doc, learning_materials['headers'], learning_materials['rows'])
+
+    evidence_index = report_content.get('evidence_index')
+    if isinstance(evidence_index, dict) and evidence_index.get('headers') and evidence_index.get('rows'):
+        doc.add_heading('Evidence Index', level=1)
+        doc.add_paragraph(
+            'Repository files cited by the findings in this report, for traceability:'
+        )
+        _add_table(doc, evidence_index['headers'], evidence_index['rows'])
 
     if report_content.get('sources'):
         doc.add_heading('Sources', level=1)

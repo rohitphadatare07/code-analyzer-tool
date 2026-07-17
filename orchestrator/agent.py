@@ -54,9 +54,13 @@ list_output_files = None
 read_output_file = None
 generate_assessment_report = None
 
+try_extract_assessment_request = None
+run_full_assessment = None
+
 def _load_tools():
     global codebase_analysis_agent, modernization_readiness_agent, business_rules_agent
     global security_compliance_agent, list_output_files, read_output_file, generate_assessment_report
+    global try_extract_assessment_request, run_full_assessment
     if codebase_analysis_agent is None:
         from tools.assessmenttransform import (
             codebase_analysis_agent as _codebase,
@@ -67,6 +71,10 @@ def _load_tools():
         )
         from tools.security_analysis import security_compliance_agent as _security
         from tools.synthesis import generate_assessment_report as _report
+        from tools.pipeline import (
+            try_extract_assessment_request as _try_extract,
+            run_full_assessment as _run_full,
+        )
         codebase_analysis_agent = _codebase
         modernization_readiness_agent = _readiness
         business_rules_agent = _bizrules
@@ -74,6 +82,8 @@ def _load_tools():
         list_output_files = _list
         read_output_file = _read
         generate_assessment_report = _report
+        try_extract_assessment_request = _try_extract
+        run_full_assessment = _run_full
 from tools.memory_hooks import ShortTermMemoryHook
 
 # Initialize the App
@@ -102,6 +112,15 @@ analysis on prospective-client repositories. You NEVER modify, execute, build, t
 changes to client source code, and you NEVER open pull requests. You only read code and produce
 analysis findings.
 
+You are the FALLBACK path: invoke() (agent.py) already tries a deterministic pipeline
+(tools/pipeline.py) first for any request that clearly names repos to assess - that path runs
+all 4 analyses in real parallel code and only calls report synthesis once every analysis's
+actual status is success, with no LLM tool-calling judgment involved. You are only reached for
+everything that pipeline didn't confidently classify as a clear assessment request: ambiguous
+or partial requests, follow-up questions, result/status lookups, or out-of-scope requests you
+should decline. You still have all the same tools below for these cases - use your judgment,
+since these requests don't share one fixed shape.
+
 # Available Tools
 
 Per-repository analysis (each call BLOCKS until that analysis finishes and returns its result
@@ -120,9 +139,10 @@ directly — there is no separate job-status step to poll):
 Report synthesis (run ONLY after all 4 analyses above have returned success for a repository):
 5. **generate_assessment_report**: Cross-references the 4 analyses' output_dirs and produces the
    technical due-diligence DOCX (Executive Summary + 10 sections, in this order: current
-   architecture, business logic, security & compliance, modernization readiness, recommended
-   to-be architecture, recommended AWS services, migration roadmap, cost benefit, performance
-   benefit, risks & mitigations), with supporting tables and diagrams where the underlying
+   architecture, implemented business rule extraction, security & compliance, modernization
+   readiness, recommended to-be architecture, recommended AWS services, migration roadmap,
+   cost benefit, performance benefit, risks & mitigations), with supporting tables and
+   diagrams where the underlying
    data supports them. Every section is now synthesized from real findings, for one repo or
    many. Cost/performance benefit and migration roadmap are directional estimates, clearly
    labeled.
@@ -209,9 +229,34 @@ def create_orchestrator(session_id: str = None, actor_id: str = None) -> Agent:
 
 @app.entrypoint
 def invoke(payload):
-    """Bedrock AgentCore entrypoint."""
+    """
+    Bedrock AgentCore entrypoint.
+
+    Tries the deterministic pipeline (tools/pipeline.py) first: if the request
+    clearly names one or more repos to assess, the 4 analyses run in real
+    parallel Python code (not LLM-driven tool-calling) and synthesis is gated
+    on their actual status. Anything that doesn't classify as a clear
+    assessment request - status/result lookups, out-of-scope execute/upgrade
+    requests, general questions - falls back to the conversational Agent
+    below, unchanged.
+    """
     try:
         user_message = payload.get("prompt", payload.get("message", ""))
+        _load_tools()
+
+        assessment_request = try_extract_assessment_request(user_message)
+        if assessment_request:
+            logger.info(
+                f"Routing to deterministic pipeline: "
+                f"{len(assessment_request['repos'])} repo(s)"
+            )
+            result = run_full_assessment(
+                assessment_request["repos"],
+                assessment_request.get("client_name", ""),
+                assessment_request.get("context", ""),
+            )
+            logger.info(f"Deterministic pipeline finished with status={result.get('status')}")
+            return {"result": result}
 
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         session_id = f"atx-transform-{timestamp}"
@@ -221,7 +266,7 @@ def invoke(payload):
             actor_id="atx_user"
         )
 
-        logger.info("Starting ATX Transform orchestration")
+        logger.info("Starting ATX Transform orchestration (conversational fallback)")
         response = orchestrator(user_message)
         logger.info("Orchestration completed")
 

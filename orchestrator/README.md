@@ -8,11 +8,32 @@ in `CLAUDE.md` at the repo root.
 
 ## Architecture
 
-The orchestrator is a Strands `Agent` with 7 tools, all agents-as-tools style (each takes a
-single free-text `query` string — see "Why one string arg?" below):
+`agent.py`'s `invoke()` is a two-path hybrid, not a single always-LLM-driven flow:
 
 ```
-Orchestrator (agent.py)
+invoke(payload)
+├── try_extract_assessment_request()  → classifies: does this clearly name repo(s) to assess?
+│
+├── YES → tools/pipeline.py: run_full_assessment()          [deterministic path]
+│         real Python control flow, no LLM tool-calling judgment involved:
+│         1. ThreadPoolExecutor runs all 4 analyses × all repos IN PARALLEL
+│            (bounded by MAX_PARALLEL_ANALYSES, default 8)
+│         2. Checks each analysis's REAL status field
+│         3. Only if every analysis for every repo succeeded, calls
+│            synthesis.py's _generate_report_from_repo_dirs() directly
+│         4. Otherwise returns partial_failure naming exactly which analysis
+│            failed for which repo — never synthesizes from incomplete data
+│
+└── NO  → conversational Strands Agent (ORCHESTRATOR_PROMPT below)  [fallback path]
+          for status/result lookups, follow-ups, ambiguous or out-of-scope
+          requests — anything that doesn't have the pipeline's fixed shape
+```
+
+The conversational fallback is a Strands `Agent` with 7 tools, all agents-as-tools style
+(each takes a single free-text `query` string — see "Why one string arg?" below):
+
+```
+Orchestrator (agent.py, conversational fallback)
 ├── codebase_analysis_agent          → AWS/comprehensive-codebase-analysis (1 repo)
 ├── modernization_readiness_agent    → AWS/modernization-readiness-analysis (1 repo)
 ├── business_rules_agent             → AWS/business-rules-extraction (1 repo)
@@ -21,6 +42,14 @@ Orchestrator (agent.py)
 ├── list_output_files                → list a completed analysis's output files
 └── read_output_file                 → read a specific output file's contents
 ```
+
+Both paths call the same underlying functions (`tools/assessmenttransform.py`'s
+`_run_analysis`, `tools/security_analysis.py`'s `_run_security_analysis`,
+`tools/synthesis.py`'s `_generate_report_from_repo_dirs`) — the deterministic path calls them
+directly from Python (parallel, structured data in/out, no NL parsing needed since it already
+has structured repo/output_dir data), while the conversational path reaches them through the
+`@tool`-wrapped, NL-extracting, one-repo-at-a-time versions in the diagram above. See
+`tools/pipeline.py`'s module docstring for the full rationale.
 
 **No AWS Batch.** Each of the 3 TD-backed analysis tools runs synchronously: it `git clone`s
 the target repo to local disk, then runs `atx custom def exec -n <TD> -p <repo> -x -t` as a
@@ -37,6 +66,18 @@ to `osv-scanner` (dependency/CVE) and `detect-secrets` (secrets detection) again
    Documentation MCP server**'s tools (`search_documentation`, `read_documentation`,
    `recommend`, launched via `uvx`), so AWS service/migration recommendations are grounded
    in real documentation, not just model training knowledge.
+
+Both synthesis calls' system prompts carry a Bedrock `cachePoint` right after their (fully
+static, identical every call) instructional text, and the strategy call's `_read_findings`
+reads known-important files (project-overview.md, technical-debt-report.md, etc.) first so a
+`MAX_FINDINGS_CHARS` truncation always drops less-referenced files, never those. The strategy
+call's own findings/context payload also omits Security & Compliance Analysis's raw findings
+(already fully distilled into the codebase call's section 3) and only receives sections 1/3/4
+of the codebase call's output, not all of it — section 2's 9 subsections are the largest part
+of that payload and no strategy-section guidance references it directly. A `_ToolCallBudget`
+hook (`tools/synthesis.py`) caps AWS Documentation MCP tool calls per report
+(`MAX_AWS_DOC_TOOL_CALLS`, default 8) so `read_documentation`'s full-page results can't grow
+that one call's context unboundedly.
 
 Every factual sentence inside a section's narrative text must carry an inline citation tag
 (`[[finding:...]]` / `[[doc:...]]`) — never inside a table cell, chart value, or diagram
@@ -82,7 +123,8 @@ new tools consistent with this pattern.
 
 | File | Purpose |
 |------|---------|
-| `agent.py` | Orchestrator: system prompt, tool wiring, AgentCore entrypoint |
+| `agent.py` | Orchestrator: entrypoint routing (deterministic pipeline vs. conversational fallback), system prompt, tool wiring |
+| `tools/pipeline.py` | Deterministic path: `try_extract_assessment_request` (classifier) + `run_full_assessment` (parallel `ThreadPoolExecutor` analysis + status-gated synthesis) |
 | `tools/assessmenttransform.py` | The 3 TD-backed per-repo analysis tools + `list_output_files`/`read_output_file` |
 | `tools/security_analysis.py` | `security_compliance_agent` — native osv-scanner/detect-secrets scan, no TD |
 | `tools/synthesis.py` | `generate_assessment_report` — the two-call synthesis described above |
@@ -164,6 +206,10 @@ pip install -r requirements.txt
 
 export AWS_REGION=us-east-1
 export BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
+export MAX_PARALLEL_ANALYSES=8   # optional; caps concurrent atx/scanner subprocesses
+                                  # spawned by the deterministic pipeline (tools/pipeline.py)
+export MAX_AWS_DOC_TOOL_CALLS=8  # optional; caps AWS Documentation MCP tool calls per
+                                  # report (tools/synthesis.py's strategy call)
 
 python agent.py   # Runs on http://localhost:8080
 ```

@@ -315,7 +315,10 @@ def security_compliance_agent(query: str) -> Dict[str, Any]:
         if not source:
             return {"status": "error", "error": "Could not extract a repository source from the request."}
         result = _run_security_analysis(source, params.get('context', ''))
-        return {"status": "success", "result": json.dumps(result)}
+        # Propagate the REAL inner status - _run_security_analysis returns "error" if
+        # the repo clone failed, "success" otherwise (scanner degradation is a warning,
+        # not a failure, by design - see module docstring).
+        return {"status": result.get("status", "error"), "result": json.dumps(result)}
     except Exception as e:
         logger.error(f"security_compliance_agent failed: {e}", exc_info=True)
         return {"status": "error", "error": str(e)}

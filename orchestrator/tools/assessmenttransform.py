@@ -234,7 +234,10 @@ def codebase_analysis_agent(query: str) -> Dict[str, Any]:
         if not source:
             return {"status": "error", "error": "Could not extract a repository source from the request."}
         result = _run_analysis(ANALYSIS_TDS['codebase'], source, params.get('context', ''), 'codebase')
-        return {"status": "success", "result": json.dumps(result)}
+        # Propagate the REAL inner status (did the atx exec actually succeed?), not an
+        # optimistic "success" that only means "this Python call didn't raise." A caller
+        # checking top-level status alone must see the true outcome.
+        return {"status": result.get("status", "error"), "result": json.dumps(result)}
     except Exception as e:
         logger.error(f"codebase_analysis_agent failed: {e}", exc_info=True)
         return {"status": "error", "error": str(e)}
@@ -272,7 +275,7 @@ Default agent_scope to "read-only" if not specified (this is due diligence, not 
             ctx_parts.append(f"avoid: {params['avoid']}")
         flattened_context = " | ".join(p for p in ctx_parts if p)
         result = _run_analysis(ANALYSIS_TDS['readiness'], source, flattened_context, 'readiness')
-        return {"status": "success", "result": json.dumps(result)}
+        return {"status": result.get("status", "error"), "result": json.dumps(result)}
     except Exception as e:
         logger.error(f"modernization_readiness_agent failed: {e}", exc_info=True)
         return {"status": "error", "error": str(e)}
@@ -295,7 +298,7 @@ def business_rules_agent(query: str) -> Dict[str, Any]:
         if not source:
             return {"status": "error", "error": "Could not extract a repository source from the request."}
         result = _run_analysis(ANALYSIS_TDS['business_rules'], source, params.get('context', ''), 'bizrules')
-        return {"status": "success", "result": json.dumps(result)}
+        return {"status": result.get("status", "error"), "result": json.dumps(result)}
     except Exception as e:
         logger.error(f"business_rules_agent failed: {e}", exc_info=True)
         return {"status": "error", "error": str(e)}

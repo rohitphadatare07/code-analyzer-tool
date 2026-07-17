@@ -12,7 +12,7 @@ tools/visuals.py) - not just prose.
 Drafted as TWO separate agent calls, not one, so groundedness is structurally
 checkable (Tier 2) rather than just prompted-for:
 
-1. Codebase-grounded call - sections 1 (architecture), 2 (business logic),
+1. Codebase-grounded call - sections 1 (architecture), 2 (implemented business rule extraction),
    3 (security & compliance), 4 (modernization readiness). Given ZERO tools
    (not just told not to use them - it structurally cannot call anything).
    Every narrative sentence must carry a [[finding:<Source Label>]] tag naming
@@ -63,12 +63,13 @@ import os
 import json
 import glob
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List
 from datetime import datetime
 
 from strands import Agent, tool
 from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
+from strands.hooks import BeforeToolCallEvent, HookProvider, HookRegistry
 from mcp import StdioServerParameters, stdio_client
 
 from .assessmenttransform import _extract_params, WORKSPACE_ROOT
@@ -87,6 +88,12 @@ MAX_FINDINGS_CHARS = 150000  # per-repo, per-TD cap fed into the synthesis promp
 # the LLM ever saw them - _read_findings truncates the tail of the concatenation, not
 # per-file, so a low cap silently drops whole files rather than shrinking all of them.
 # 150K chars is still well within Claude's context window per findings source.
+
+MAX_AWS_DOC_TOOL_CALLS = int(os.getenv("MAX_AWS_DOC_TOOL_CALLS", "8"))
+# Caps how many AWS Documentation MCP tool calls the strategy call may make while
+# drafting sections 5-10. read_documentation can return a full doc page each time;
+# nothing else bounds how many of those accumulate in that one Agent call's context
+# before it finishes drafting - see _ToolCallBudget below.
 
 FINDING_LABELS = {
     "Comprehensive Codebase Analysis",
@@ -198,6 +205,14 @@ Section 1 - Current Architecture of the Codebase:
   - Subsections should cover: architecture overview, technology stack (with a table:
     Technology | Version | EOL Status, if the findings name concrete versions), code
     quality & complexity, technical debt summary.
+  - "Technical debt summary" subsection: the Comprehensive Codebase Analysis findings
+    include a file named technical-debt-report.md (find the "--- <path> ---" chunk for it).
+    Source this subsection's narrative from that file's actual content - reuse its real
+    findings/items rather than writing a generic technical-debt narrative. If it itemizes
+    specific debt items (e.g. with severity/priority/location/remediation effort), also
+    include a "table": {"headers": ["Debt Item", "Severity", "Location", "Remediation Effort"],
+    "rows": [...]} reusing those items verbatim. Omit the table if the report doesn't
+    itemize debt in a tabular way; never invent items to fill it.
   - Section-level "diagram": a current-architecture boxes-and-arrows diagram. See the
     REUSE REAL DIAGRAMS rule above - check the findings for an actual diagram before
     inventing one from prose. Shape:
@@ -208,7 +223,7 @@ Section 1 - Current Architecture of the Codebase:
     text shown in the box. Omit "diagram" entirely only if the findings don't describe
     distinct components clearly enough to draw - this should be rare.
 
-Section 2 - Business Logic & Domain Understanding:
+Section 2 - Implemented Business Rule Extraction:
   - The Business Rules Extraction findings are organized into a KNOWN file/folder structure
     (confirmed against real output) - each file's content in the findings text is preceded by
     a "--- <relative path> ---" header (see _read_findings). Use those paths to locate the
@@ -337,7 +352,23 @@ Section 4 - Modernization Readiness:
         Table: {"headers": ["Approach", "Description", "Level of Effort", "Recommendation"],
                 "rows": [...]} - reuse the TD's own approach options (Strengthen as Modular
           Monolith / Strangler Fig / Conditional-Adaptive / Big-Bang Rewrite) verbatim, not
-          invented alternatives."""
+          invented alternatives.
+
+REPORT-LEVEL APPENDICES (top-level JSON keys, siblings of "sections" - NOT nested inside any
+section, and NOT numbered subsections). These render at the very end of the DOCX, after all
+10 numbered sections. Both are sourced from the Modernization Readiness Analysis findings,
+which already contain this content verbatim - extract it, do not invent or re-look-up links:
+
+- "learning_materials": {"headers": ["Pathway", "Learning Resources"], "rows": [...]} - the
+  findings' own Learning Materials table already maps each TRIGGERED pathway to specific AWS
+  Skill Builder / documentation links. Reuse those rows and URLs EXACTLY as given in the
+  findings - never invent a URL here. Include ONLY rows for pathways with status Triggered
+  (matches the source TD's own convention). If no pathways are triggered, OMIT this key
+  entirely rather than fabricating a row or a URL.
+- "evidence_index": {"headers": ["File Path", "Referenced By", "Context"], "rows": [...]} -
+  the findings' own Evidence Index (or the per-question "Evidence" fields if no dedicated
+  Evidence Index section exists) lists which files were cited by which findings. Reuse it
+  directly. OMIT this key entirely if the findings don't include file-level evidence citations."""
 
 _CODEBASE_WORKED_EXAMPLE = """
 
@@ -435,7 +466,12 @@ shape (worked example - illustrative content only, replace with what the finding
       "chart": {"type": "scorecard_bar", "title": "Modernization Readiness Scorecard", "scale_max": 4,
                 "dimensions": [{"name": "Infrastructure, Platform, and DevOps", "score": 2}, {"name": "Application Architecture", "score": 3}, {"name": "Data Platform Modernization", "score": 2}, {"name": "Security Baseline", "score": 2}, {"name": "Operations & Observability", "score": 2}]}
     }
-  }
+  },
+  "learning_materials": {"headers": ["Pathway", "Learning Resources"],
+    "rows": [["Move to Containers", "Move to Containers with Amazon ECS (https://skillbuilder.aws/learning-plan/CDA8Y4JRRR)"],
+              ["Move to Managed Databases", "Move to Managed Databases (https://skillbuilder.aws/learning-plan/VNJ8FZ3ZRC)"]]},
+  "evidence_index": {"headers": ["File Path", "Referenced By", "Context"],
+    "rows": [["infra/main.tf", "INF-Q1, INF-Q2", "EC2 instance and self-managed MySQL definitions"]]}
 }
 
 If a section's findings are too thin to write meaningfully, say so explicitly in that
@@ -462,6 +498,19 @@ patterns) would strengthen it. Look up a service before recommending it.
 _STRATEGY_SECTION_GUIDANCE = """
 
 SECTION-SPECIFIC STRUCTURED DATA (this call drafts sections 5, 6, 7, 8, 9, 10 + executive_summary)
+
+Executive Summary:
+  - The Comprehensive Codebase Analysis findings include a file named project-overview.md
+    (find the "--- <path> ---" chunk for it). It contains a section describing what the
+    application/system actually does. Open the executive summary with that description,
+    reused from project-overview.md - do not write your own generic "what this system does"
+    description instead of it. Tag this opening with [[finding:Comprehensive Codebase Analysis]]
+    since it's a real sourced claim (the "no citation tag needed" exemption below applies only
+    to the forward-looking framing that follows it, not to this factual description).
+  - After that opening, continue with 3-5 sentences for a CTO/VP audience: current-state pain
+    points (including any material security/compliance findings from section 3, and the
+    target architecture from section 5), recommended direction, headline benefits. No
+    citation tag needed on this forward-looking framing portion.
 
 Section 5 - Recommended To-Be Architecture:
   - REQUIRED for every engagement, regardless of how many repositories are in scope - never
@@ -620,7 +669,7 @@ actually say):
                   "rows": [["Undocumented checkout rollback behavior", "Medium", "High", "Add explicit integration tests for checkout failure paths before cutover"]]}]
     }
   },
-  "executive_summary": "3-5 sentences for a CTO/VP audience: current-state pain points (including any material security/compliance findings from section 3, and the target architecture from section 5), recommended direction, headline benefits. No citation tag needed on the executive summary itself."
+  "executive_summary": "Acme Corp's order-management platform is a Java/Spring monolith that processes online orders, applies loyalty pricing, and manages inventory for its e-commerce storefront. [[finding:Comprehensive Codebase Analysis]] The platform's self-managed EC2 compute and MySQL 5.6 database represent the highest-priority modernization gaps, both past end-of-life support. We recommend migrating to Amazon ECS on Fargate and Aurora MySQL, which would eliminate manual patching and enable horizontal scaling."
 }
 
 Section 3 (Security & Compliance Findings) is drafted by your colleague in the OTHER agent
@@ -638,20 +687,46 @@ STRATEGY_SECTIONS_PROMPT = (
 )
 
 
+# Filenames the synthesis prompts above name explicitly as a subsection's source (project
+# overview / tech debt / bounded contexts / mod-readiness JSON / traceability, etc.) - read
+# these FIRST in _read_findings so that if MAX_FINDINGS_CHARS truncates the tail of the
+# concatenation, it always drops less-referenced files, never one of these, regardless of
+# filesystem/glob iteration order (which is not meaningful or stable).
+_PRIORITY_FINDINGS_FILENAMES = {
+    "project-overview.md", "technical-debt-report.md",
+    "bounded-contexts.md", "domain-manifest.json", "execution-order.md",
+    "traceability-matrix.md", "requirements-summary.md",
+    "cross-domain-features.md", "shared-kernel.md", "data-ownership.md",
+    "api-endpoint-catalog.md", "external-integrations-map.md",
+    "service-component-inventory.md",
+}
+
+
 def _read_findings(output_dir: str) -> str:
-    """Concatenate an analysis TD's output files into one capped text blob."""
+    """
+    Concatenate an analysis TD's output files into one capped text blob.
+
+    Files in _PRIORITY_FINDINGS_FILENAMES sort first; the rest follow in a fixed
+    alphabetical order (not raw glob order, which isn't stable/meaningful) - so a
+    MAX_FINDINGS_CHARS truncation always cuts from the same deterministic tail.
+    """
     if not output_dir or not os.path.isdir(output_dir):
         return ""
+    paths = [
+        p for pattern in ("**/*.md", "**/*.json")
+        for p in glob.glob(os.path.join(output_dir, pattern), recursive=True)
+        if os.path.isfile(p)
+    ]
+    paths.sort(key=lambda p: (os.path.basename(p) not in _PRIORITY_FINDINGS_FILENAMES, p))
+
     chunks = []
-    for pattern in ("**/*.md", "**/*.json"):
-        for path in glob.glob(os.path.join(output_dir, pattern), recursive=True):
-            if os.path.isfile(path):
-                try:
-                    with open(path, "r", encoding="utf-8", errors="replace") as f:
-                        rel = os.path.relpath(path, output_dir)
-                        chunks.append(f"--- {rel} ---\n{f.read()}")
-                except Exception:
-                    continue
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                rel = os.path.relpath(path, output_dir)
+                chunks.append(f"--- {rel} ---\n{f.read()}")
+        except Exception:
+            continue
     return "\n\n".join(chunks)[:MAX_FINDINGS_CHARS]
 
 
@@ -749,38 +824,104 @@ def _normalize_section(section: Any, section_key: str) -> Dict[str, Any]:
     return normalized
 
 
-def _synthesize_sections(findings_by_repo: Dict[str, Dict[str, str]], context: str) -> Dict[str, Any]:
-    findings_text = ""
-    for repo, findings in findings_by_repo.items():
-        findings_text += f"\n\n=== Repository: {repo} ===\n"
-        for label, text in findings.items():
-            findings_text += f"\n[{label}]\n{text or '(no output captured)'}\n"
+class _ToolCallBudget(HookProvider):
+    """
+    Caps how many times specific tools may be called within one Agent invocation.
 
+    The AWS Documentation MCP tools (search_documentation/read_documentation/recommend)
+    can each return a full doc page's worth of text - nothing else bounds how many of
+    those accumulate in the strategy call's context before it finishes drafting sections
+    5-10. Once the budget is spent, further calls to a tracked tool are cancelled as a
+    normal tool-error result (not an exception) telling the model to proceed with what
+    it already retrieved, rather than letting that one call's context grow unboundedly.
+    """
+
+    def __init__(self, tool_names: set, max_calls: int):
+        self.tool_names = tool_names
+        self.max_calls = max_calls
+        self.calls_made = 0
+
+    def on_before_tool_call(self, event: BeforeToolCallEvent) -> None:
+        name = event.tool_use.get("name", "")
+        if name not in self.tool_names:
+            return
+        if self.calls_made >= self.max_calls:
+            event.cancel_tool = (
+                f"AWS documentation lookup budget ({self.max_calls} calls) for this report "
+                f"has been reached. Proceed with drafting using the AWS documentation already "
+                f"retrieved plus the analysis findings - do not attempt further lookups."
+            )
+            return
+        self.calls_made += 1
+
+    def register_hooks(self, registry: HookRegistry) -> None:
+        registry.add_callback(BeforeToolCallEvent, self.on_before_tool_call)
+
+
+def _build_findings_text(findings_by_repo: Dict[str, Dict[str, str]], labels: set) -> str:
+    text = ""
+    for repo, findings in findings_by_repo.items():
+        text += f"\n\n=== Repository: {repo} ===\n"
+        for label, content in findings.items():
+            if label not in labels:
+                continue
+            text += f"\n[{label}]\n{content or '(no output captured)'}\n"
+    return text
+
+
+def _synthesize_sections(findings_by_repo: Dict[str, Dict[str, str]], context: str) -> Dict[str, Any]:
     # --- Call 1: codebase-grounded sections, structurally NO tools ---
     # Section 2's 9-subsection design (each with its own table) makes this call's JSON
     # output substantially larger than the strategy call's - give it more room so a long
     # response doesn't get cut off mid-JSON (which would fail _parse_json_response outright).
-    codebase_agent = Agent(model=_make_bedrock_model(max_tokens=16000), system_prompt=CODEBASE_SECTIONS_PROMPT, tools=[])
-    codebase_result = codebase_agent(f"Findings:{findings_text}")
+    # A cachePoint after the (fully static, identical on every call) system prompt lets
+    # Bedrock reuse that cached prefix across calls instead of paying full input-token
+    # price for the same instructional text every single report generation.
+    codebase_findings_text = _build_findings_text(findings_by_repo, FINDING_LABELS)
+    codebase_agent = Agent(
+        model=_make_bedrock_model(max_tokens=16000),
+        system_prompt=[{"text": CODEBASE_SECTIONS_PROMPT}, {"cachePoint": {"type": "default"}}],
+        tools=[],
+    )
+    codebase_result = codebase_agent(f"Findings:{codebase_findings_text}")
     codebase_text = _extract_agent_text(codebase_result)
     codebase_json = _parse_json_response(codebase_text)
     codebase_trace = extract_tool_trace(codebase_agent)  # expected to always be empty
 
     # --- Call 2: AWS-strategy sections, WITH MCP tools ---
+    # Security & Compliance Analysis's raw findings are NOT re-sent here: they're already
+    # fully distilled into codebase_json's section 3 (passed below), and that TD's output is
+    # native scanner JSON with no diagram to search for (excluded from REUSE REAL DIAGRAMS),
+    # so the strategy call has no use for the raw blob a second time. Likewise, only sections
+    # 1/3/4 of codebase_json are passed back, not the whole thing - section 2's 9 business-
+    # rule subsections/tables are the single largest part of that payload, and no
+    # strategy-section guidance ever asks this call to reference section 2 directly (it cites
+    # Business Rules Extraction findings straight from the raw findings text when needed,
+    # e.g. in the risk register) - avoids paying twice for the same large content once as
+    # raw findings and again as codebase_json's own restatement of it.
+    strategy_findings_text = _build_findings_text(findings_by_repo, FINDING_LABELS - {"Security & Compliance Analysis"})
+    codebase_context_for_strategy = {
+        "sections": {k: v for k, v in codebase_json.get("sections", {}).items() if k in ("1", "3", "4")}
+    }
     strategy_prompt = (
-        f"Engagement context: {context}\n\nFindings:{findings_text}\n\n"
+        f"Engagement context: {context}\n\nFindings:{strategy_findings_text}\n\n"
         f"Already-drafted codebase-facing sections (for context, do not re-cite these as "
-        f"[[doc:...]]):{json.dumps(codebase_json)}"
+        f"[[doc:...]]):{json.dumps(codebase_context_for_strategy)}"
     )
+    strategy_system_prompt = [{"text": STRATEGY_SECTIONS_PROMPT}, {"cachePoint": {"type": "default"}}]
     try:
         with _aws_docs_mcp_client:
             mcp_tools = _aws_docs_mcp_client.list_tools_sync()
-            strategy_agent = Agent(model=_make_bedrock_model(), system_prompt=STRATEGY_SECTIONS_PROMPT, tools=mcp_tools)
+            tool_budget = _ToolCallBudget({t.tool_name for t in mcp_tools}, MAX_AWS_DOC_TOOL_CALLS)
+            strategy_agent = Agent(
+                model=_make_bedrock_model(), system_prompt=strategy_system_prompt,
+                tools=mcp_tools, hooks=[tool_budget],
+            )
             strategy_result = strategy_agent(strategy_prompt)
             strategy_trace = extract_tool_trace(strategy_agent)
     except Exception as e:
         logger.warning(f"AWS Documentation MCP server unavailable, falling back to ungrounded synthesis: {e}")
-        strategy_agent = Agent(model=_make_bedrock_model(), system_prompt=STRATEGY_SECTIONS_PROMPT, tools=[])
+        strategy_agent = Agent(model=_make_bedrock_model(), system_prompt=strategy_system_prompt, tools=[])
         strategy_result = strategy_agent(strategy_prompt)
         strategy_trace = []
 
@@ -805,7 +946,14 @@ def _synthesize_sections(findings_by_repo: Dict[str, Dict[str, str]], context: s
             all_doc_urls.update(doc_urls)
         clean_sections[key] = section
 
-    return {
+    # Report-level appendices (top-level keys, not nested in "sections") - sourced from the
+    # codebase call only, since Modernization Readiness Analysis findings are read there.
+    # No citation tags expected in these (plain tables), so no stripping needed - just
+    # structural validation via _normalize_table.
+    learning_materials = _normalize_table(codebase_json.get("learning_materials"))
+    evidence_index = _normalize_table(codebase_json.get("evidence_index"))
+
+    result = {
         "client_name": strategy_json.get("client_name", ""),
         "sections": clean_sections,
         "executive_summary": strip_citations(strategy_json.get("executive_summary", "")),
@@ -817,6 +965,54 @@ def _synthesize_sections(findings_by_repo: Dict[str, Dict[str, str]], context: s
             "strategy_sections_unverified": strategy_ground["unverified"],
             "aws_doc_tool_calls_made": len(strategy_trace),
         },
+    }
+    if learning_materials:
+        result["learning_materials"] = learning_materials
+    if evidence_index:
+        result["evidence_index"] = evidence_index
+    return result
+
+
+def _generate_report_from_repo_dirs(repos: List[Dict[str, str]], client_name: str, context: str) -> Dict[str, Any]:
+    """
+    Shared core: takes already-structured repo/output_dir data (no NL parsing) and
+    produces the DOCX. Used by BOTH the NL-driven @tool below (generate_assessment_report,
+    for conversational/ad-hoc use) AND tools/pipeline.py's deterministic
+    run_full_assessment (which already has this data in code and skips the @tool's NL
+    extraction entirely - no reason to describe-then-re-parse data we already have).
+
+    repos: [{"name": str, "codebase_output_dir": str, "readiness_output_dir": str,
+             "business_rules_output_dir": str, "security_output_dir": str}]
+    Raises on malformed input - callers decide how to surface that as a tool error.
+    """
+    findings_by_repo = {}
+    for r in repos:
+        name = r.get('name', 'repo')
+        findings_by_repo[name] = {
+            "Comprehensive Codebase Analysis": _read_findings(r.get('codebase_output_dir', '')),
+            "Modernization Readiness Analysis": _read_findings(r.get('readiness_output_dir', '')),
+            "Business Rules Extraction": _read_findings(r.get('business_rules_output_dir', '')),
+            "Security & Compliance Analysis": _read_findings(r.get('security_output_dir', '')),
+        }
+
+    sections_result = _synthesize_sections(findings_by_repo, context)
+    sections_result['repos'] = list(findings_by_repo.keys())
+    if client_name:
+        sections_result['client_name'] = client_name
+
+    groundedness = sections_result.pop('groundedness')
+    if groundedness['codebase_sections_unverified'] or groundedness['strategy_sections_unverified']:
+        logger.warning(f"Unverified citations in generated report: {groundedness}")
+
+    job_name = f"report-{'-'.join(findings_by_repo.keys())[:40]}-{int(datetime.utcnow().timestamp())}"
+    output_path = os.path.join(WORKSPACE_ROOT, "reports", f"{job_name}.docx")
+    build_docx(sections_result, output_path)
+
+    return {
+        "report_path": output_path,
+        "client_name": sections_result.get('client_name', ''),
+        "repos": sections_result['repos'],
+        "groundedness": groundedness,
     }
 
 
@@ -848,35 +1044,8 @@ def generate_assessment_report(query: str) -> Dict[str, Any]:
         if not repos:
             return {"status": "error", "error": "Could not extract repo/output_dir info from the request."}
 
-        findings_by_repo = {}
-        for r in repos:
-            name = r.get('name', 'repo')
-            findings_by_repo[name] = {
-                "Comprehensive Codebase Analysis": _read_findings(r.get('codebase_output_dir', '')),
-                "Modernization Readiness Analysis": _read_findings(r.get('readiness_output_dir', '')),
-                "Business Rules Extraction": _read_findings(r.get('business_rules_output_dir', '')),
-                "Security & Compliance Analysis": _read_findings(r.get('security_output_dir', '')),
-            }
-
-        sections_result = _synthesize_sections(findings_by_repo, params.get('context', ''))
-        sections_result['repos'] = list(findings_by_repo.keys())
-        if params.get('client_name'):
-            sections_result['client_name'] = params['client_name']
-
-        groundedness = sections_result.pop('groundedness')
-        if groundedness['codebase_sections_unverified'] or groundedness['strategy_sections_unverified']:
-            logger.warning(f"Unverified citations in generated report: {groundedness}")
-
-        job_name = f"report-{'-'.join(findings_by_repo.keys())[:40]}-{int(datetime.utcnow().timestamp())}"
-        output_path = os.path.join(WORKSPACE_ROOT, "reports", f"{job_name}.docx")
-        build_docx(sections_result, output_path)
-
-        return {"status": "success", "result": json.dumps({
-            "report_path": output_path,
-            "client_name": sections_result.get('client_name', ''),
-            "repos": sections_result['repos'],
-            "groundedness": groundedness,
-        })}
+        result = _generate_report_from_repo_dirs(repos, params.get('client_name', ''), params.get('context', ''))
+        return {"status": "success", "result": json.dumps(result)}
     except json.JSONDecodeError as e:
         return {"status": "error", "error": f"Failed to parse synthesis output: {e}"}
     except Exception as e:
