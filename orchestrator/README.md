@@ -16,8 +16,7 @@ invoke(payload)
 │
 ├── YES → tools/pipeline.py: run_full_assessment()          [deterministic path]
 │         real Python control flow, no LLM tool-calling judgment involved:
-│         1. ThreadPoolExecutor runs all 4 analyses × all repos IN PARALLEL
-│            (bounded by MAX_PARALLEL_ANALYSES, default 8)
+│         1. Runs all 4 analyses × all repos SEQUENTIALLY, one at a time
 │         2. Checks each analysis's REAL status field
 │         3. Only if every analysis for every repo succeeded, calls
 │            synthesis.py's _generate_report_from_repo_dirs() directly
@@ -46,10 +45,10 @@ Orchestrator (agent.py, conversational fallback)
 Both paths call the same underlying functions (`tools/assessmenttransform.py`'s
 `_run_analysis`, `tools/security_analysis.py`'s `_run_security_analysis`,
 `tools/synthesis.py`'s `_generate_report_from_repo_dirs`) — the deterministic path calls them
-directly from Python (parallel, structured data in/out, no NL parsing needed since it already
-has structured repo/output_dir data), while the conversational path reaches them through the
-`@tool`-wrapped, NL-extracting, one-repo-at-a-time versions in the diagram above. See
-`tools/pipeline.py`'s module docstring for the full rationale.
+directly from Python (sequentially, structured data in/out, no NL parsing needed since it
+already has structured repo/output_dir data), while the conversational path reaches them
+through the `@tool`-wrapped, NL-extracting, one-repo-at-a-time versions in the diagram above.
+See `tools/pipeline.py`'s module docstring for the full rationale.
 
 **No AWS Batch.** Each of the 3 TD-backed analysis tools runs synchronously: it `git clone`s
 the target repo to local disk, then runs `atx custom def exec -n <TD> -p <repo> -x -t` as a
@@ -124,7 +123,7 @@ new tools consistent with this pattern.
 | File | Purpose |
 |------|---------|
 | `agent.py` | Orchestrator: entrypoint routing (deterministic pipeline vs. conversational fallback), system prompt, tool wiring |
-| `tools/pipeline.py` | Deterministic path: `try_extract_assessment_request` (classifier) + `run_full_assessment` (parallel `ThreadPoolExecutor` analysis + status-gated synthesis) |
+| `tools/pipeline.py` | Deterministic path: `try_extract_assessment_request` (classifier) + `run_full_assessment` (sequential analysis + status-gated synthesis) |
 | `tools/assessmenttransform.py` | The 3 TD-backed per-repo analysis tools + `list_output_files`/`read_output_file` |
 | `tools/security_analysis.py` | `security_compliance_agent` — native osv-scanner/detect-secrets scan, no TD |
 | `tools/synthesis.py` | `generate_assessment_report` — the two-call synthesis described above |
@@ -206,8 +205,6 @@ pip install -r requirements.txt
 
 export AWS_REGION=us-east-1
 export BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
-export MAX_PARALLEL_ANALYSES=8   # optional; caps concurrent atx/scanner subprocesses
-                                  # spawned by the deterministic pipeline (tools/pipeline.py)
 export MAX_AWS_DOC_TOOL_CALLS=8  # optional; caps AWS Documentation MCP tool calls per
                                   # report (tools/synthesis.py's strategy call)
 

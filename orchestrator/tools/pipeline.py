@@ -2,8 +2,8 @@
 Deterministic Assessment Pipeline
 
 Runs the 4 per-repo analysis tools (codebase, readiness, business rules,
-security/compliance) in PARALLEL - across repos AND across analysis kinds -
-via a thread pool, then gates report synthesis behind their REAL status.
+security/compliance) SEQUENTIALLY, one at a time, then gates report synthesis
+behind their REAL status.
 
 Why this exists: the original design put all sequencing ("run these 4 tools,
 wait for success, then call the report tool") into English inside the
@@ -20,18 +20,14 @@ request, falling back to the conversational Strands Agent (agent.py's
 ORCHESTRATOR_PROMPT) for anything else - status lookups, out-of-scope
 requests, follow-up questions.
 
-Concurrency note: _run_analysis/_run_security_analysis are blocking
-subprocess/network calls (git clone, atx exec, scanner subprocesses), not
-CPU-bound work - they release the GIL while blocked, so a plain
-ThreadPoolExecutor gives real parallelism here without needing asyncio.
-Concurrency is capped (MAX_PARALLEL_ANALYSES) rather than left unbounded,
-since a large multi-repo engagement could otherwise spawn dozens of
-simultaneous `atx`/scanner subprocesses on one host.
+Note: an earlier version of this module ran the 4 analyses in parallel via a
+ThreadPoolExecutor (they're blocking subprocess/network calls that release the
+GIL, so real concurrency was possible). That was reverted back to sequential
+execution - one `atx`/scanner subprocess in flight at a time, run in a fixed,
+predictable order.
 """
 
-import os
 import logging
-import concurrent.futures
 from typing import Any, Dict, List, Optional
 
 from .assessmenttransform import _extract_params, _run_analysis, ANALYSIS_TDS
@@ -40,8 +36,6 @@ from .synthesis import _generate_report_from_repo_dirs
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-MAX_PARALLEL_ANALYSES = int(os.getenv("MAX_PARALLEL_ANALYSES", "8"))
 
 _ANALYSIS_KINDS = ("codebase", "readiness", "business_rules", "security")
 
@@ -94,31 +88,25 @@ def run_full_assessment(repos: List[Dict[str, str]], client_name: str, context: 
     """
     repos: [{"name": str, "source": str}, ...]
 
-    Runs all 4 analyses for every repo IN PARALLEL (bounded by
-    MAX_PARALLEL_ANALYSES), checks each one's REAL status, and only calls the
-    synthesis/report step if every analysis for every repo succeeded. On any
-    failure, returns a clear partial-failure result naming exactly which
-    analysis failed for which repo, rather than silently generating a report
-    from incomplete data.
+    Runs all 4 analyses for every repo SEQUENTIALLY, one at a time, checks each
+    one's REAL status, and only calls the synthesis/report step if every
+    analysis for every repo succeeded. On any failure, returns a clear
+    partial-failure result naming exactly which analysis failed for which
+    repo, rather than silently generating a report from incomplete data.
     """
     if not repos:
         return {"status": "error", "error": "No repositories provided."}
 
-    max_workers = min(len(repos) * len(_ANALYSIS_KINDS), MAX_PARALLEL_ANALYSES)
     logger.info(
         f"Running full assessment for {len(repos)} repo(s), "
-        f"{len(_ANALYSIS_KINDS)} analyses each, max_workers={max_workers}"
+        f"{len(_ANALYSIS_KINDS)} analyses each, sequentially"
     )
 
     per_repo: Dict[str, Dict[str, Any]] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(_run_one, kind, repo["source"], context): (repo["name"], kind)
-            for repo in repos for kind in _ANALYSIS_KINDS
-        }
-        for future in concurrent.futures.as_completed(future_map):
-            repo_name, kind = future_map[future]
-            per_repo.setdefault(repo_name, {})[kind] = future.result()
+    for repo in repos:
+        per_repo[repo["name"]] = {}
+        for kind in _ANALYSIS_KINDS:
+            per_repo[repo["name"]][kind] = _run_one(kind, repo["source"], context)
 
     repo_status: Dict[str, Any] = {}
     all_succeeded = True
